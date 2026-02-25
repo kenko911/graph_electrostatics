@@ -1,6 +1,6 @@
 # `graph_longrange`
 
-`graph_longrange` provides blah in pytorch, for use in X. The repo works mostly with Gaussian type orbitals, and provides the following fundamental operations. All the code is pytorch and for systems up to a few thousand atoms on a single GPU, the code is reasonably fast compared to many modern MLIPs.
+`graph_longrange` provides various long-range operatoins in pytorch, for use in charge-aware MLIPs. The repo works mostly with Gaussian type orbitals, and provides the following fundamental operations. All the code is pytorch and for systems up to a few thousand atoms on a single GPU, the code is reasonably fast compared to many modern MLIPs.
 
 - [x] **Coulomb Energy** from a set of atoms with **atomic multipole moments**
 - [x] **Atom Centered Electrostatic Features**, similar to the LODE descriptor 

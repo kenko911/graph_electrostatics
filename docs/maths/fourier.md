@@ -33,39 +33,13 @@ $\tilde{f}(\mathbf{k})$ are the fourier series coeficients and are defined only 
 > 
 > so that the cell vectors $`\mathbf{a}_i`$ and reciprocal lattice vectors $`\mathbf{b}_i`$ satisfy $`\mathbf{a}_{i} \cdot \mathbf{b}_{j} = \delta_{ij}`$.
 
-## Relation to Unnormalized FFT
+## Impact on Parsevals theorem
 
-Assume a real-space grid with $N = N_x N_y N_z$ points,
-
-$$
-\mathbf{x}_{\mathbf{n}} = A \frac{\mathbf{n}}{\mathbf{N}}, \quad \mathbf{n}\in\{0,\ldots,N_x-1\}\times\{0,\ldots,N_y-1\}\times\{0,\ldots,N_z-1\},
-$$
-
-and reciprocal grid
+The above expression for the fourier series coefficients, involving $(2\pi)^3 / \Omega$, implies a certain form for parsevals theorem:
 
 $$
-\mathbf{k}_{\mathbf{m}} = B \mathbf{m}, \quad \mathbf{m}\in\{0,\ldots,N_x-1\}\times\{0,\ldots,N_y-1\}\times\{0,\ldots,N_z-1\}.
+\int_\Omega f^\star(\mathbf{r}) g(\mathbf{r}) d \mathbf{r} = \frac{\Omega}{(2\pi)^6} \sum_{\mathbf{k} \in \Lambda^\star} \tilde{f}^\star(\mathbf{k}) \tilde{g}(\mathbf{k})
 $$
-
-Then
-
-$$
-e^{-i\mathbf{k}_{\mathbf{m}}\cdot \mathbf{x}_{\mathbf{n}}} = e^{-2\pi i\, \mathbf{m}\cdot \mathbf{n}/\mathbf{N}},
-$$
-
-so the unnormalized forward FFT output
-
-$$
-F_{\mathbf{m}} = \sum_{\mathbf{n}} f(\mathbf{x}_{\mathbf{n}}) e^{-2\pi i\, \mathbf{m}\cdot \mathbf{n}/\mathbf{N}}
-$$
-
-relates to the Fourier-series coefficients by the Riemann-sum approximation
-
-$$
-\tilde{f}(\mathbf{k}_{\mathbf{m}}) \approx \frac{(2\pi)^3}{\Omega}\left(\frac{\Omega}{N}\right) F_{\mathbf{m}} = \frac{(2\pi)^3}{N} F_{\mathbf{m}}.
-$$
-
-This matches the default unnormalized forward FFT convention in NumPy/PyTorch (inverse has the $1/N$ factor).
 
 ## Lattice of Functions
 
@@ -104,6 +78,41 @@ f(\mathbf{x}) = \frac{2}{(2\pi)^3}\sum_{\mathbf{k}_x > 0}\left[\Re\{\tilde{f}(\m
 $$
 
 For brevity we will omit writing the $\mathbf{k}=\mathbf{0}$ term since it will be zero in most cases.
+
+
+## Relation to Unnormalized FFT
+
+Assume a real-space grid with $N = N_x N_y N_z$ points,
+
+$$
+\mathbf{x}_{\mathbf{n}} = A \frac{\mathbf{n}}{\mathbf{N}}, \quad \mathbf{n}\in\{0,\ldots,N_x-1\}\times\{0,\ldots,N_y-1\}\times\{0,\ldots,N_z-1\},
+$$
+
+and reciprocal grid
+
+$$
+\mathbf{k}_{\mathbf{m}} = B \mathbf{m}, \quad \mathbf{m}\in\{0,\ldots,N_x-1\}\times\{0,\ldots,N_y-1\}\times\{0,\ldots,N_z-1\}.
+$$
+
+Then
+
+$$
+e^{-i\mathbf{k}_{\mathbf{m}}\cdot \mathbf{x}_{\mathbf{n}}} = e^{-2\pi i\, \mathbf{m}\cdot \mathbf{n}/\mathbf{N}},
+$$
+
+so the unnormalized forward FFT output
+
+$$
+F_{\mathbf{m}} = \sum_{\mathbf{n}} f(\mathbf{x}_{\mathbf{n}}) e^{-2\pi i\, \mathbf{m}\cdot \mathbf{n}/\mathbf{N}}
+$$
+
+relates to the Fourier-series coefficients by the Riemann-sum approximation
+
+$$
+\tilde{f}(\mathbf{k}_{\mathbf{m}}) \approx \frac{(2\pi)^3}{\Omega}\left(\frac{\Omega}{N}\right) F_{\mathbf{m}} = \frac{(2\pi)^3}{N} F_{\mathbf{m}}.
+$$
+
+This matches the default unnormalized forward FFT convention in NumPy/PyTorch (inverse has the $1/N$ factor).
 
 ## Derivations
 

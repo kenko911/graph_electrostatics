@@ -2,7 +2,7 @@
 
 ## charge density expanded in GTOs
 
-Consider a set of atoms at positions $\{x_i\}_i$, which have atomic multipoles in spherical notation $p_{ilm}$. We introduce a gaussian type orbital (GTO) basis:
+Consider a set of atoms at positions $`\{x_i\}_i`$, which have atomic multipoles in spherical notation $`p_{ilm}`$. We introduce a gaussian type orbital (GTO) basis:
 
 $$\phi_{nlm}(\mathbf{r}) = C_{l\sigma_n} e^{-\frac{r^2}{2\sigma_n^2}} r^{l} Y_{lm}(\hat{\mathbf{r}})$$
 

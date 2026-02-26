@@ -4,7 +4,7 @@ This file derives the expressions used in the code for building the k-space dens
 and projecting electrostatic features. Conventions for Fourier series are in
 `docs/maths/fourier.md`, and the GTO basis is defined in `docs/maths/gto.md`.
 
-## Density from multipoles (real space)
+## Density from multipoles
 
 Given atomic multipoles $p_{ilm}$ at positions $\mathbf{r}_i$, the periodic density is
 
@@ -37,15 +37,11 @@ $$
 then
 
 $$
-\Re\{\tilde{\rho}\} = \frac{(2\pi)^3}{\Omega}
-\sum_{lm}\left(\Re\{\tilde{\phi}_{nlm}\}\,C^R_{lm}
- + \Im\{\tilde{\phi}_{nlm}\}\,C^I_{lm}\right),
+\Re\{\tilde{\rho}\} = \frac{(2\pi)^3}{\Omega} \sum_{lm}\left(\Re\{\tilde{\phi}_{nlm}\}\,C^R_{lm} + \Im\{\tilde{\phi}_{nlm}\}\,C^I_{lm}\right),
 $$
 
 $$
-\Im\{\tilde{\rho}\} = \frac{(2\pi)^3}{\Omega}
-\sum_{lm}\left(\Im\{\tilde{\phi}_{nlm}\}\,C^R_{lm}
- - \Re\{\tilde{\phi}_{nlm}\}\,C^I_{lm}\right).
+\Im\{\tilde{\rho}\} = \frac{(2\pi)^3}{\Omega} \sum_{lm}\left(\Im\{\tilde{\phi}_{nlm}\}\,C^R_{lm} - \Re\{\tilde{\phi}_{nlm}\}\,C^I_{lm}\right).
 $$
 
 These are the expressions implemented by `assemble_fourier_series_batch`.
@@ -85,28 +81,23 @@ $$
 Using Parseval and the lattice transform for $\phi_{nlm}^{\mathrm{repeated}}$, we obtain
 
 $$
-v^i_{nlm} = \frac{1}{(2\pi)^3}\sum_{\mathbf{k}\in\Lambda^\star}
-\tilde{v}(\mathbf{k})\,\tilde{\phi}_{nlm}(\mathbf{k})\,e^{-i\mathbf{k}\cdot\mathbf{r}_i}.
+v^i_{nlm} = \frac{1}{(2\pi)^3}\sum_{\mathbf{k}\in\Lambda^\star} \tilde{v}(\mathbf{k})\,\tilde{\phi}_{nlm}(\mathbf{k})\,e^{-i\mathbf{k}\cdot\mathbf{r}_i}.
 $$
 
 For a real potential, the half-space form is
 
 $$
-v^i_{nlm} = \frac{2}{(2\pi)^3}\sum_{\mathbf{k}_x>0}
-\left[A_{nlm}(\mathbf{k})\cos(\mathbf{k}\cdot\mathbf{r}_i)
- + B_{nlm}(\mathbf{k})\sin(\mathbf{k}\cdot\mathbf{r}_i)\right],
+v^i_{nlm} = \frac{2}{(2\pi)^3}\sum_{\mathbf{k}_x>0}\left[A_{nlm}(\mathbf{k})\cos(\mathbf{k}\cdot\mathbf{r}_i) + B_{nlm}(\mathbf{k})\sin(\mathbf{k}\cdot\mathbf{r}_i)\right],
 $$
 
 where
 
 $$
-A_{nlm} = \Re\{\tilde{v}\}\Re\{\tilde{\phi}_{nlm}\}
- + \Im\{\tilde{v}\}\Im\{\tilde{\phi}_{nlm}\},
+A_{nlm} = \Re\{\tilde{v}\}\Re\{\tilde{\phi}_{nlm}\} + \Im\{\tilde{v}\}\Im\{\tilde{\phi}_{nlm}\},
 $$
 
 $$
-B_{nlm} = \Re\{\tilde{v}\}\Im\{\tilde{\phi}_{nlm}\}
- - \Im\{\tilde{v}\}\Re\{\tilde{\phi}_{nlm}\}.
+B_{nlm} = \Re\{\tilde{v}\}\Im\{\tilde{\phi}_{nlm}\} - \Im\{\tilde{v}\}\Re\{\tilde{\phi}_{nlm}\}.
 $$
 
 These contractions are implemented by `project_to_features_batch`.

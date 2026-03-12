@@ -18,7 +18,7 @@ function.
 
 ## Density Fourier series coefficients
 
-Using the lattice transform result (see `docs/maths/fourier.md`), the Fourier-series
+We use the same definition of the Fourier coefficients on the reciprocal lattice as in `fourier.md`. Using the lattice transform result, the Fourier-series
 coefficients are
 
 $$
@@ -68,23 +68,35 @@ $$
 = \sum_{\mathbf{a}\in\Lambda} \phi_{nlm}(\mathbf{r}-\mathbf{a}).
 $$
 
-This “repeated” basis is just the periodic extension of the local orbital. It is used
-so the projection integral can be taken over the unit cell while remaining equivalent
-to an integral over all space.
-
-The projection is
+The features are then defined as:
 
 $$
 v^i_{nlm} = \int_\Omega v(\mathbf{r})\,\phi_{nlm}^{\mathrm{repeated}}(\mathbf{r}-\mathbf{r}_i)\,d\mathbf{r}.
 $$
 
-Using Parseval and the lattice transform for $\phi_{nlm}^{\mathrm{repeated}}$, we obtain
+We will calculate this using Parseval’s identity. The fourier series $\tilde v(\mathbf{k})$ is given above, and the fourier series of $\phi_{nlm}^{\mathrm{repeated}}(\mathbf{r})$ is:
 
 $$
-v^i_{nlm} = \frac{1}{(2\pi)^3}\sum_{\mathbf{k}\in\Lambda^\star} \tilde{v}(\mathbf{k})\,\tilde{\phi}_{nlm}(\mathbf{k})\,e^{-i\mathbf{k}\cdot\mathbf{r}_i}.
+\widetilde{\phi_{nlm}^{\mathrm{repeated}}}(\mathbf{k})
+ = \frac{(2\pi)^3}{\Omega}\tilde{\phi}_{nlm}(\mathbf{k}).
 $$
 
-For a real potential, the half-space form is
+Where $\tilde{\phi}_{nlm}(\mathbf{k})$ is the fourier **transform** of $\phi_{nlm}(\mathbf{r})$. Parseval's identity for our definition of fourier series coefficients is:
+
+$$
+\int_\Omega f(\mathbf{r})\,g(\mathbf{r})^{\star}\,d\mathbf{r}
+ = \frac{\Omega}{(2\pi)^6}\sum_{\mathbf{k}\in\Lambda^\star} \tilde{f}(\mathbf{k})\,\tilde{g}^{\ast}(\mathbf{k}),
+$$
+
+Therefore the features are:
+
+$$
+v^i_{nlm}
+ = \frac{1}{(2\pi)^3}\sum_{\mathbf{k}\in\Lambda^\star}
+\tilde{v}(\mathbf{k})\left(\tilde{\phi}_{nlm}(\mathbf{k})\,e^{-i\mathbf{k}\cdot\mathbf{r}_i}\right)^{\ast}.
+$$
+
+The phase factor appears because of the shift to $\mathbf{r}_i$. Because all our basis functions and fields are real valued, we can simplify this using $\tilde{f}(-\mathbf{k}) = \tilde{f}(\mathbf{k})^{\ast}$:
 
 $$
 v^i_{nlm} = \frac{2}{(2\pi)^3}\sum_{\mathbf{k}_x>0}\left[A_{nlm}(\mathbf{k})\cos(\mathbf{k}\cdot\mathbf{r}_i) + B_{nlm}(\mathbf{k})\sin(\mathbf{k}\cdot\mathbf{r}_i)\right],

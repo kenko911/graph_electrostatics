@@ -126,7 +126,7 @@ $$
 
 $$
 v_{i,nlm} = \frac{1}{(2\pi)^3}\sum_{\mathbf{k}}
-\tilde{v}(\mathbf{k})\,\tilde{\phi}_{nlm}(\mathbf{k})\,e^{-i\mathbf{k}\cdot\mathbf{r}_i}.
+\tilde{v}(\mathbf{k})^{\star} \,\tilde{\phi}_{nlm}(\mathbf{k})\,e^{-i\mathbf{k}\cdot\mathbf{r}_i}.
 $$
 
 In code, only one half-space of k-vectors is stored and real/imaginary parts are handled

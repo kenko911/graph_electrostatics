@@ -43,8 +43,9 @@ class RadialIntegralDirect(torch.nn.Module):
             dtype=k_mods.dtype,
             device=k_mods.device,
         )
-        torch.mul(self.pref0, exp_term, out=out[..., 0])
-        torch.mul(self.pref1, k_mods.unsqueeze(-1) * exp_term, out=out[..., 1])
+        out0 = self.pref0 * exp_term
+        out1 = self.pref1 * k_mods.unsqueeze(-1) * exp_term
+        out = torch.stack([out0,out1], dim=-1)
         return out
 
 
@@ -145,8 +146,10 @@ class GTOBasis(torch.nn.Module):
     def _prepare_k_moduli(
         self, k_norm2: torch.Tensor, k0_mask: torch.Tensor
     ) -> torch.Tensor:
-        k_moduli = torch.sqrt(torch.clamp_min(k_norm2, 0.0))
-        k_moduli.masked_fill_(k0_mask > 0.0, 0.0)
+        nonzero_mask = ~(k0_mask > 0.0)
+
+        k_moduli = torch.zeros_like(k_norm2)
+        k_moduli[nonzero_mask] = torch.sqrt(torch.clamp_min(k_norm2[nonzero_mask], 1e-16))
         return k_moduli
 
     def _compute_ylmk(self, k_vectors: torch.Tensor) -> torch.Tensor:
@@ -355,7 +358,9 @@ class DisplacedGTOExternalFieldBlock(torch.nn.Module):
         potential_from_displacement = torch.einsum(
             "bi,bi->b", positions, node_fields[:, 1:].clone()
         )
-        node_fields[:, 0] += potential_from_displacement
+
+        node_fields_updated = node_fields.clone()
+        node_fields_updated[:, 0] = node_fields_updated[:, 0] + potential_from_displacement
 
         node_fields = node_fields[:, [0, 3, 1, 2]]
         projections = torch.einsum("pf,nf->np", self.matrix, node_fields)

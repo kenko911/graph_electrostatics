@@ -165,11 +165,6 @@ class RealSpaceFiniteDiffereneEnergy(torch.nn.Module):
         batch: torch.Tensor,  # [n_node]
     ) -> torch.Tensor:
         extended_positions = positions.repeat_interleave(4, dim=0)
-        extended_positions[1::4] += self.x
-        extended_positions[2::4] += self.y
-        extended_positions[3::4] += self.z
-
-        extended_batch = batch.repeat_interleave(4)
         charges = torch.zeros_like(extended_positions[:, 0])
 
         charges[1::4] = source_feats[:, 3] / self.offset
@@ -335,22 +330,30 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         positions: torch.Tensor,
         batch: torch.Tensor,
     ) -> torch.Tensor:
-        extended_positions = positions.repeat_interleave(4, dim=0)
-        extended_positions[1::4] += self.x
-        extended_positions[2::4] += self.y
-        extended_positions[3::4] += self.z
+        # 7 positions per atom: center(0), +x(1), +y(2), +z(3), -x(4), -y(5), -z(6).
+        # Centered finite differences make the probe sets of symmetric atoms exact
+        # mirror images of each other, preserving molecular point-group symmetry.
+        extended_positions = positions.repeat_interleave(7, dim=0)
+        extended_positions[1::7] += self.x
+        extended_positions[2::7] += self.y
+        extended_positions[3::7] += self.z
+        extended_positions[4::7] -= self.x
+        extended_positions[5::7] -= self.y
+        extended_positions[6::7] -= self.z
 
-        extended_batch = batch.repeat_interleave(4)
+        extended_batch = batch.repeat_interleave(7)
         charges = torch.zeros_like(extended_positions[:, 0])
 
-        charges[1::4] = source_feats[:, 3] / self.offset
-        charges[2::4] = source_feats[:, 1] / self.offset
-        charges[3::4] = source_feats[:, 2] / self.offset
-        charges[0::4] = source_feats[:, 0] - (
-            charges[1::4] + charges[2::4] + charges[3::4]
-        )
+        two_offset = 2.0 * self.offset
+        charges[0::7] = source_feats[:, 0]                          # q at center
+        charges[1::7] = source_feats[:, 3] / two_offset             # +x: +mu_x/(2δ)
+        charges[2::7] = source_feats[:, 1] / two_offset             # +y: +mu_y/(2δ)
+        charges[3::7] = source_feats[:, 2] / two_offset             # +z: +mu_z/(2δ)
+        charges[4::7] = -source_feats[:, 3] / two_offset            # -x: -mu_x/(2δ)
+        charges[5::7] = -source_feats[:, 1] / two_offset            # -y: -mu_y/(2δ)
+        charges[6::7] = -source_feats[:, 2] / two_offset            # -z: -mu_z/(2δ)
 
-        edge_index = batch_complete_graph_excluding_self_duplicates_vector(batch, 4)
+        edge_index = batch_complete_graph_excluding_self_duplicates_vector(batch, 7)
 
         scalar_features = charges_features_from_graph(
             charges=charges,
@@ -358,7 +361,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
             edge_index=edge_index,
             batch=extended_batch,
             total_width_factors=self.total_width_factors.unsqueeze(0),
-        )  # [all_nodes, num_radial]
+        )  # [7*n_nodes, num_radial]
 
         all_features = torch.zeros(
             batch.size(0),
@@ -367,16 +370,19 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
             device=batch.device,
         )
 
-        all_features[:, : self.num_radial] = self.l0_factors * scalar_features[0::4]
+        # l=0: potential at center.
+        all_features[:, : self.num_radial] = self.l0_factors * scalar_features[0::7]
+        # l=1 (SH [y,z,x] order): centered difference (V_+ - V_-) / 2.
+        # Leading order is δ·E, same as one-sided, so l1_factors is unchanged.
         all_features[:, self.num_radial :: 3] = self.l1_factors * (
-            scalar_features[2::4] - scalar_features[0::4]
-        )
+            scalar_features[2::7] - scalar_features[5::7]
+        ) / 2
         all_features[:, self.num_radial + 1 :: 3] = self.l1_factors * (
-            scalar_features[3::4] - scalar_features[0::4]
-        )
+            scalar_features[3::7] - scalar_features[6::7]
+        ) / 2
         all_features[:, self.num_radial + 2 :: 3] = self.l1_factors * (
-            scalar_features[1::4] - scalar_features[0::4]
-        )
+            scalar_features[1::7] - scalar_features[4::7]
+        ) / 2
 
         return all_features
 

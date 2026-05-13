@@ -11,7 +11,7 @@ import torch
 from scipy.constants import pi
 
 from .gto_utils import GTOBasis, GTOSelfInteractionBlock, GTOInternalFieldtoFeaturesBlock
-from .realspace_electrostatics import RealSpaceFiniteDifferenceElectrostaticFeatures
+from .realspace_electrostatics import RealSpaceAnalyticalElectrostaticFeatures
 from .slabs import (
     CorrectivePotentialBlock,
     slab_dipole_correction_node_fields,
@@ -366,7 +366,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             normalize_source="multipoles",
             normalize_receive=integral_normalization,
         )
-        self.realspace_features = RealSpaceFiniteDifferenceElectrostaticFeatures(
+        self.realspace_features = RealSpaceAnalyticalElectrostaticFeatures(
             density_max_l=density_max_l,
             density_smearing_width=density_smearing_width,
             projection_max_l=feature_max_l,
@@ -696,7 +696,7 @@ class GTOElectrostaticFeaturesMultiChannel(torch.nn.Module):
             normalize_source="multipoles",
             normalize_receive=integral_normalization,
         )
-        self.realspace_features = RealSpaceFiniteDifferenceElectrostaticFeatures(
+        self.realspace_features = RealSpaceAnalyticalElectrostaticFeatures(
             density_max_l=density_max_l,
             density_smearing_width=density_smearing_width,
             projection_max_l=feature_max_l,

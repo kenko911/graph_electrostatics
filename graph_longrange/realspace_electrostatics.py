@@ -164,17 +164,27 @@ class RealSpaceFiniteDiffereneEnergy(torch.nn.Module):
         positions: torch.Tensor,  # [n_node, 3]
         batch: torch.Tensor,  # [n_node]
     ) -> torch.Tensor:
-        extended_positions = positions.repeat_interleave(4, dim=0)
+        extended_positions = positions.repeat_interleave(7, dim=0)
+        extended_positions[1::7] += self.x
+        extended_positions[2::7] += self.y
+        extended_positions[3::7] += self.z
+        extended_positions[4::7] -= self.x
+        extended_positions[5::7] -= self.y
+        extended_positions[6::7] -= self.z
+
+        extended_batch = batch.repeat_interleave(7)
         charges = torch.zeros_like(extended_positions[:, 0])
 
-        charges[1::4] = source_feats[:, 3] / self.offset
-        charges[2::4] = source_feats[:, 1] / self.offset
-        charges[3::4] = source_feats[:, 2] / self.offset
-        charges[0::4] = source_feats[:, 0] - (
-            charges[1::4] + charges[2::4] + charges[3::4]
-        )
+        two_offset = 2.0 * self.offset
+        charges[0::7] = source_feats[:, 0]
+        charges[1::7] = source_feats[:, 3] / two_offset
+        charges[2::7] = source_feats[:, 1] / two_offset
+        charges[3::7] = source_feats[:, 2] / two_offset
+        charges[4::7] = -source_feats[:, 3] / two_offset
+        charges[5::7] = -source_feats[:, 1] / two_offset
+        charges[6::7] = -source_feats[:, 2] / two_offset
 
-        edge_index = batch_complete_graph_excluding_self_duplicates_vector(batch, 4)
+        edge_index = batch_complete_graph_excluding_self_duplicates_vector(batch, 7)
 
         energy = charges_energy_from_graph(
             charges,
@@ -422,3 +432,343 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
             features += self_interaction_terms
 
         return features, self_interaction_terms, None
+
+
+# ---------------------------------------------------------------------------
+# Analytical real-space multipole energy (replaces finite-difference approach)
+# ---------------------------------------------------------------------------
+
+def _smeared_coulomb_kernels(
+    r: torch.Tensor, sigma: float
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Kernel functions for GTO-smeared Coulomb potential T(r) = erf(r/(2σ))/r.
+
+    Returns T0, fp, fpp where:
+      T0  = erf(r/(2σ)) / r
+      fp  = T'(r)  = (g - T0) / r,     g = exp(-r²/(4σ²)) / (σ√π)
+      fpp = T''(r) = -g/(2σ²) - 2g/r² + 2T0/r²
+    """
+    r_safe = r.clamp(min=1e-10)
+    g = torch.exp(-r_safe.pow(2) / (4.0 * sigma ** 2)) / (sigma * math.sqrt(math.pi))
+    T0 = torch.erf(r_safe / (2.0 * sigma)) / r_safe
+    fp = (g - T0) / r_safe
+    fpp = -g / (2.0 * sigma ** 2) - 2.0 * g / r_safe.pow(2) + 2.0 * T0 / r_safe.pow(2)
+    return T0, fp, fpp
+
+
+def multipole_energy_from_graph(
+    source_feats: torch.Tensor,  # [n_nodes, 4]: [q, μ_y, μ_z, μ_x] (e3nn SH order)
+    positions: torch.Tensor,     # [n_nodes, 3]
+    edge_index: torch.Tensor,    # [2, n_edges]
+    batch: torch.Tensor,
+    sigma: float,
+) -> torch.Tensor:
+    """
+    Analytical energy for charge + dipole densities (l=0,1) with GTO smearing.
+
+    Pair energy between sender i (charge q_s, dipole μ_s) and receiver j (q_r, μ_r):
+      E_ij = K/(4π) * [
+          q_s*q_r*T0
+        + (q_s*(μ_r·R̂) - q_r*(μ_s·R̂)) * T'
+        + (μ_s·μ_r) * T'/r
+        + (μ_s·R̂)*(μ_r·R̂) * (T'' - T'/r)
+      ]
+    with R = r_j - r_i, r = |R|, R̂ = R/r.
+    """
+    sender, receiver = edge_index
+    if sender.numel() == 0:
+        n_graphs = int(batch.max().item()) + 1
+        return torch.zeros(n_graphs, dtype=source_feats.dtype, device=source_feats.device)
+
+    R = positions[receiver] - positions[sender]       # [n_edges, 3]
+    r = torch.linalg.norm(R, dim=-1)                  # [n_edges]
+    r_safe = r.clamp(min=1e-10)
+    Rhat = R / r_safe.unsqueeze(-1)                   # [n_edges, 3]
+
+    T0, fp, fpp = _smeared_coulomb_kernels(r_safe, sigma)
+    fp_over_r = fp / r_safe
+
+    q_s = source_feats[sender, 0]
+    q_r = source_feats[receiver, 0]
+    # e3nn SH l=1 order is [m=-1,0,+1] = [y,z,x]; reorder to Cartesian [x,y,z]
+    idx = source_feats.new_tensor([3, 1, 2], dtype=torch.long)
+    mu_s = source_feats[sender][:, idx]               # [n_edges, 3]: (μ_x, μ_y, μ_z)
+    mu_r = source_feats[receiver][:, idx]
+
+    mu_s_Rhat = (mu_s * Rhat).sum(-1)
+    mu_r_Rhat = (mu_r * Rhat).sum(-1)
+    mu_dot = (mu_s * mu_r).sum(-1)
+
+    pair_energy = (
+        q_s * q_r * T0
+        + (q_s * mu_r_Rhat - q_r * mu_s_Rhat) * fp
+        - fp_over_r * mu_dot
+        + (fp_over_r - fpp) * mu_s_Rhat * mu_r_Rhat
+    )
+
+    edge_energy = 0.5 * FIELD_CONSTANT / (4.0 * pi) * pair_energy
+    node_energies = scatter_sum(src=edge_energy, index=receiver, dim=0,
+                                out=torch.zeros(positions.shape[0],
+                                                dtype=edge_energy.dtype,
+                                                device=edge_energy.device))
+    return scatter_sum(src=node_energies, index=batch, dim=0)
+
+
+class RealSpaceAnalyticalEnergy(torch.nn.Module):
+    """
+    Analytical real-space electrostatic energy for l=0,1 GTO charge densities.
+
+    Replaces RealSpaceFiniteDiffereneEnergy: no finite-difference offset, no
+    ghost atoms — computes charge/charge, charge/dipole, and dipole/dipole
+    interactions directly from the smeared Coulomb kernel and its derivatives.
+    """
+
+    def __init__(
+        self,
+        density_max_l: int,
+        density_smearing_width: float,
+        include_self_interaction: bool = False,
+    ):
+        if density_max_l > 1:
+            raise ValueError("RealSpaceAnalyticalEnergy only supports l=0 and l=1.")
+        super().__init__()
+        self.density_max_l = density_max_l
+        self.density_smearing_width = density_smearing_width
+        self.include_self_interaction = include_self_interaction
+        self.self_interaction = GTOSelfInteractionBlock(
+            density_max_l,
+            density_smearing_width,
+            density_max_l,
+            [density_smearing_width],
+            "multipoles",
+            "multipoles",
+        )
+
+    def forward(
+        self,
+        source_feats: torch.Tensor,  # [n_nodes, (l+1)^2] or [n_nodes, 1, (l+1)^2]
+        positions: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> torch.Tensor:
+        feats = source_feats.squeeze(-2) if source_feats.dim() == 3 else source_feats
+        edge_index = batch_complete_graph_excluding_self_duplicates_vector(batch, 1)
+
+        if self.density_max_l == 0:
+            energy = charges_energy_from_graph(
+                feats.squeeze(-1),
+                positions,
+                edge_index,
+                batch,
+                density_smearing_width=self.density_smearing_width,
+            )
+        else:
+            energy = multipole_energy_from_graph(
+                feats,
+                positions,
+                edge_index,
+                batch,
+                sigma=self.density_smearing_width,
+            )
+
+        if self.include_self_interaction:
+            self_fields = self.self_interaction(feats)
+            node_energies = torch.einsum("nb,nb->n", feats, self_fields)
+            self_energy = scatter_sum(src=node_energies, index=batch, dim=0)
+            energy = energy + self_energy * 0.5
+
+        return energy
+
+
+# ---------------------------------------------------------------------------
+# Analytical real-space electrostatic features
+# ---------------------------------------------------------------------------
+
+def multipole_features_from_graph(
+    source_feats: torch.Tensor,     # [n_nodes, 1] (l=0) or [n_nodes, 4] (l=1)
+    positions: torch.Tensor,        # [n_nodes, 3]
+    edge_index: torch.Tensor,       # [2, n_edges]
+    total_width_factors: torch.Tensor,  # [n_radial]  w_s = sqrt((s_src^2+s_proj_s^2)/2)
+    l0_factors: torch.Tensor,       # [n_radial]
+    l1_weight: Optional[torch.Tensor],  # [n_radial] or None if projection_max_l==0
+    density_max_l: int,
+    projection_max_l: int,
+) -> torch.Tensor:
+    """
+    Analytical l=0,1 feature projection for GTO densities.
+
+    For each (sender=j, receiver=i) edge with R = r_i - r_j:
+
+      l=0 from q_j:   +K/4pi * q_j * T_s
+      l=0 from mu_j:  -K/4pi * (mu_j . Rhat) * fp_s
+
+      l=1_a from q_j:   -K/4pi * q_j * fp_s * Rhat_a
+      l=1_a from mu_j:  -K/4pi * [fp_over_r*mu_j^a - (fp_over_r-fpp)*(mu_j.Rhat)*Rhat_a]
+
+    Output shape: [n_nodes, n_radial] (proj l=0) or [n_nodes, 4*n_radial] (proj l=1).
+    """
+    num_radial = total_width_factors.shape[0]
+    n_nodes = positions.shape[0]
+    n_out = num_radial if projection_max_l == 0 else 4 * num_radial
+
+    sender, receiver = edge_index
+    if sender.numel() == 0:
+        return torch.zeros(n_nodes, n_out, dtype=source_feats.dtype, device=source_feats.device)
+
+    # R points from sender j to receiver i
+    R = positions[receiver] - positions[sender]     # [n_edges, 3]
+    r = torch.linalg.norm(R, dim=-1)               # [n_edges]
+    r_e = r.clamp(min=1e-10).unsqueeze(-1)         # [n_edges, 1]
+    Rhat = R / r_e                                  # [n_edges, 3]
+
+    # Smeared Coulomb kernels per radial channel  [n_edges, n_radial]
+    w = total_width_factors.unsqueeze(0)            # [1, n_radial]
+    g_s = torch.exp(-r_e.pow(2) / (4.0 * w.pow(2))) / (w * math.sqrt(math.pi))
+    T_s = torch.erf(r_e / (2.0 * w)) / r_e
+    fp_s = (g_s - T_s) / r_e
+
+    q_j = source_feats[sender, 0]                  # [n_edges]
+
+    # l=0 contributions per edge  [n_edges, n_radial]
+    contrib_l0 = q_j.unsqueeze(-1) * T_s
+
+    if density_max_l >= 1:
+        idx = source_feats.new_tensor([3, 1, 2], dtype=torch.long)  # (x,y,z) from e3nn
+        mu_j = source_feats[sender][:, idx]         # [n_edges, 3]
+        mu_Rhat = (mu_j * Rhat).sum(-1)             # [n_edges]
+        contrib_l0 = contrib_l0 - mu_Rhat.unsqueeze(-1) * fp_s
+
+    feat_l0 = scatter_sum(
+        contrib_l0, receiver, dim=0,
+        out=torch.zeros(n_nodes, num_radial, dtype=contrib_l0.dtype, device=contrib_l0.device),
+    )
+    feat_l0 = FIELD_CONSTANT / (4.0 * pi) * l0_factors.unsqueeze(0) * feat_l0
+
+    if projection_max_l == 0:
+        return feat_l0
+
+    # l=1 gradient contributions per edge  [n_edges, n_radial, 3]
+    fp_over_r = fp_s / r_e
+    fpp_s = -g_s / (2.0 * w.pow(2)) - 2.0 * g_s / r_e.pow(2) + 2.0 * T_s / r_e.pow(2)
+
+    # from charge q_j:  dV/dr_i = fp_s * Rhat_a * q_j  → [n_edges, n_radial, 3]
+    contrib_l1 = fp_s.unsqueeze(-1) * Rhat.unsqueeze(-2) * q_j.unsqueeze(-1).unsqueeze(-1)
+
+    if density_max_l >= 1:
+        # isotropic: -fp_over_r * mu_j^a  → [n_edges, n_radial, 3]
+        dip_iso = -fp_over_r.unsqueeze(-1) * mu_j.unsqueeze(-2)
+        # anisotropic: (fp_over_r - fpp) * (mu.Rhat) * Rhat_a  → [n_edges, n_radial, 3]
+        dip_aniso = (
+            ((fp_over_r - fpp_s) * mu_Rhat.unsqueeze(-1)).unsqueeze(-1)
+            * Rhat.unsqueeze(-2)
+        )
+        contrib_l1 = contrib_l1 + dip_iso + dip_aniso
+
+    feat_l1 = scatter_sum(
+        contrib_l1.reshape(contrib_l1.shape[0], -1),
+        receiver, dim=0,
+        out=torch.zeros(n_nodes, num_radial * 3, dtype=contrib_l1.dtype, device=contrib_l1.device),
+    ).reshape(n_nodes, num_radial, 3)   # [n_nodes, n_radial, 3]: last dim is Cartesian (x,y,z)
+
+    feat_l1 = FIELD_CONSTANT / (4.0 * pi) * l1_weight.unsqueeze(0).unsqueeze(-1) * feat_l1
+
+    # Assemble output [n_nodes, 4*n_radial]
+    # Layout: [:n_radial]=l0, then per radial: (y, z, x) matching FD convention
+    out = torch.zeros(n_nodes, n_out, dtype=source_feats.dtype, device=source_feats.device)
+    out[:, :num_radial] = feat_l0
+    out[:, num_radial::3]     = feat_l1[:, :, 1]   # y (e3nn m=-1)
+    out[:, num_radial + 1::3] = feat_l1[:, :, 2]   # z (e3nn m=0)
+    out[:, num_radial + 2::3] = feat_l1[:, :, 0]   # x (e3nn m=+1)
+    return out
+
+
+class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
+    """
+    Analytical drop-in for RealSpaceFiniteDifferenceElectrostaticFeatures.
+
+    Replaces the 7-ghost-atom FD scheme with direct evaluation of the
+    smeared Coulomb potential and its gradient at each receiver site.
+    Reduces edges from O(49 N^2) to O(2 N^2) with no offset hyperparameter.
+    """
+
+    def __init__(
+        self,
+        density_max_l: int,
+        density_smearing_width: float,
+        projection_max_l: int,
+        projection_smearing_widths: List[float],
+        include_self_interaction: bool = False,
+        integral_normalization: str = "receiver",
+    ):
+        if density_max_l > 1 or projection_max_l > 1:
+            raise ValueError("RealSpaceAnalyticalElectrostaticFeatures supports l<=1 only.")
+        super().__init__()
+        self.density_max_l = density_max_l
+        self.projection_max_l = projection_max_l
+        self.include_self_interaction = include_self_interaction
+        self.num_radial = len(projection_smearing_widths)
+
+        self.self_interaction = GTOSelfInteractionBlock(
+            density_max_l,
+            density_smearing_width,
+            projection_max_l,
+            projection_smearing_widths,
+            "multipoles",
+            integral_normalization,
+        )
+
+        w_t = torch.tensor(projection_smearing_widths, dtype=torch.get_default_dtype())
+        total_width_factors = ((density_smearing_width**2 + w_t**2) / 2).pow(0.5)
+        self.register_buffer("total_width_factors", total_width_factors)
+
+        l0_factors = torch.tensor(
+            [get_Cl_sigma(0, s, integral_normalization) / get_Cl_sigma(0, s, "multipoles")
+             for s in projection_smearing_widths],
+            dtype=torch.get_default_dtype(),
+        )
+        self.register_buffer("l0_factors", l0_factors)
+
+        if projection_max_l >= 1:
+            l1_weight = torch.tensor(
+                [3**0.5 * s**2 * get_Cl_sigma(1, s, integral_normalization)
+                 / get_Cl_sigma(0, s, "multipoles")
+                 for s in projection_smearing_widths],
+                dtype=torch.get_default_dtype(),
+            )
+            self.register_buffer("l1_weight", l1_weight)
+        else:
+            self.register_buffer("l1_weight", None)
+
+    def forward(
+        self,
+        source_feats: torch.Tensor,   # [n_nodes, 1, lm_dim] or [n_nodes, lm_dim]
+        node_positions: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> torch.Tensor:
+        feats = source_feats.squeeze(-2) if source_feats.dim() == 3 else source_feats
+        # For l=0 density with l=1 projection, pad to 4 components
+        if self.density_max_l == 0 and self.projection_max_l == 1 and feats.shape[-1] == 1:
+            padded = torch.zeros(
+                feats.shape[0], 4, dtype=feats.dtype, device=feats.device
+            )
+            padded[:, 0] = feats[:, 0]
+            feats = padded
+
+        edge_index = batch_complete_graph_excluding_self_duplicates_vector(batch, 1)
+        features = multipole_features_from_graph(
+            source_feats=feats,
+            positions=node_positions,
+            edge_index=edge_index,
+            total_width_factors=self.total_width_factors,
+            l0_factors=self.l0_factors,
+            l1_weight=self.l1_weight,
+            density_max_l=self.density_max_l,
+            projection_max_l=self.projection_max_l,
+        )
+
+        si_terms = self.self_interaction(feats if self.density_max_l >= 1 else source_feats.squeeze(-2))
+        if self.include_self_interaction:
+            features = features + si_terms
+
+        return features, si_terms, None
+

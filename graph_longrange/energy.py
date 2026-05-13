@@ -10,7 +10,7 @@ from scipy.constants import pi
 
 from .features import apply_coulomb_kernel_batch, assemble_fourier_series_batch
 from .gto_utils import GTOBasis, GTOSelfInteractionBlock
-from .realspace_electrostatics import RealSpaceFiniteDiffereneEnergy
+from .realspace_electrostatics import RealSpaceAnalyticalEnergy
 from .slabs import slab_dipole_correction_energy, MonopoleDipoleCorrectionBlock
 
 
@@ -60,7 +60,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
             normalize_source="multipoles",
             normalize_receive="multipoles",
         )
-        self.realspace_energy = RealSpaceFiniteDiffereneEnergy(
+        self.realspace_energy = RealSpaceAnalyticalEnergy(
             density_max_l=density_max_l,
             density_smearing_width=density_smearing_width,
             include_self_interaction=include_self_interaction,

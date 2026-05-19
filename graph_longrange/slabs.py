@@ -1,8 +1,7 @@
 # specifically for electrocatalysis, certain charge compensation schemes and dipole corrections are needed
-import torch 
-from mace.tools.scatter import scatter_sum, scatter_mean
+import torch
 from scipy.constants import pi
-from .utils import FIELD_CONSTANT, CUBIC_MADELUNG
+from .utils import FIELD_CONSTANT, CUBIC_MADELUNG, scatter_mean, scatter_sum
 
 
 def get_nonperiodic_charge_dipole(

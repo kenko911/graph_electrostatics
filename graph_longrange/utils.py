@@ -1,11 +1,6 @@
-import torch
 from typing import Optional, Tuple
 
-from typing import List, Tuple
-
 import torch
-from e3nn import o3
-from e3nn.util.jit import compile_mode
 
 # internal units are (electon, Volt, Angstrom)
 # 5.526349406 * 1e-3 is the value of epsilon_0 in (electon, Volt, Angstrom) units. see docs.

@@ -1,13 +1,15 @@
+import math
 import torch
 from scipy.constants import e, epsilon_0, pi
-from mace.tools.scatter import scatter_sum
-from .utils import FIELD_CONSTANT
+from .utils import FIELD_CONSTANT, scatter_sum
 from typing import List, Optional, Tuple
 import warnings
-from .gto_utils import (
-    GTOSelfInteractionBlock,
-    get_Cl_sigma,
-)
+
+
+def _load_gto_utils():
+    from .gto_utils import GTOSelfInteractionBlock, get_Cl_sigma
+
+    return GTOSelfInteractionBlock, get_Cl_sigma
 
 @torch.no_grad()
 def batch_complete_graph_excluding_self_duplicates_vector(
@@ -109,6 +111,7 @@ class RealSpaceFiniteDiffereneEnergy(torch.nn.Module):
             )
 
         super().__init__()
+        GTOSelfInteractionBlock, _ = _load_gto_utils()
         self.density_max_l = density_max_l
         self.density_smearing_width = density_smearing_width
         self.include_self_interaction = include_self_interaction
@@ -258,6 +261,7 @@ class RealSpaceFiniteDifferenceElectrostaticFeatures(torch.nn.Module):
         offset: float = 0.1,
     ):
         super().__init__()
+        GTOSelfInteractionBlock, get_Cl_sigma = _load_gto_utils()
 
         self.density_max_l = density_max_l
         self.projection_max_l = projection_max_l
@@ -457,22 +461,83 @@ def _smeared_coulomb_kernels(
     return T0, fp, fpp
 
 
+def _smeared_coulomb_third_derivative(
+    r: torch.Tensor,
+    sigma: torch.Tensor,
+    g: torch.Tensor,
+    T0: torch.Tensor,
+) -> torch.Tensor:
+    """Third radial derivative of T(r) = erf(r/(2 sigma)) / r."""
+    return (
+        r * g / (4.0 * sigma.pow(4))
+        + g / (sigma.pow(2) * r)
+        + 6.0 * g / r.pow(3)
+        - 6.0 * T0 / r.pow(3)
+    )
+
+
+def _smeared_coulomb_fourth_derivative(
+    r: torch.Tensor,
+    sigma: torch.Tensor,
+    g: torch.Tensor,
+    T0: torch.Tensor,
+) -> torch.Tensor:
+    """Fourth radial derivative of T(r) = erf(r/(2 sigma)) / r."""
+    return (
+        -r.pow(2) * g / (8.0 * sigma.pow(6))
+        - g / (4.0 * sigma.pow(4))
+        - 4.0 * g / (sigma.pow(2) * r.pow(2))
+        - 24.0 * g / r.pow(4)
+        + 24.0 * T0 / r.pow(4)
+    )
+
+
+def _l2_source_to_cartesian(source_feats: torch.Tensor) -> torch.Tensor:
+    """Convert graph_longrange l=2 real-SH coefficients to Cartesian traceless tensors.
+
+    The input ordering is the same real-harmonic order used by graph_longrange / e3nn:
+    [sqrt(3)xy, sqrt(3)yz, (3z^2-r^2)/2, sqrt(3)xz, sqrt(3)(x^2-y^2)/2].
+    """
+    q_m2, q_m1, q_0, q_p1, q_p2 = source_feats.unbind(dim=-1)
+    s3_over_2 = math.sqrt(3.0) / 2.0
+
+    t_xx = -0.5 * q_0 + s3_over_2 * q_p2
+    t_yy = -0.5 * q_0 - s3_over_2 * q_p2
+    t_zz = q_0
+    t_xy = s3_over_2 * q_m2
+    t_yz = s3_over_2 * q_m1
+    t_xz = s3_over_2 * q_p1
+
+    return torch.stack(
+        [
+            torch.stack([t_xx, t_xy, t_xz], dim=-1),
+            torch.stack([t_xy, t_yy, t_yz], dim=-1),
+            torch.stack([t_xz, t_yz, t_zz], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
 def multipole_energy_from_graph(
-    source_feats: torch.Tensor,  # [n_nodes, 4]: [q, μ_y, μ_z, μ_x] (e3nn SH order)
+    source_feats: torch.Tensor,  # [n_nodes, 1], [n_nodes, 4], or [n_nodes, 9]
     positions: torch.Tensor,     # [n_nodes, 3]
     edge_index: torch.Tensor,    # [2, n_edges]
     batch: torch.Tensor,
     sigma: float,
 ) -> torch.Tensor:
     """
-    Analytical energy for charge + dipole densities (l=0,1) with GTO smearing.
+    Analytical energy for charge, dipole, and quadrupole densities with GTO smearing.
 
-    Pair energy between sender i (charge q_s, dipole μ_s) and receiver j (q_r, μ_r):
+    Pair energy between sender i and receiver j with source multipoles
+    (q_s, μ_s, Q_s) and receiver multipoles (q_r, μ_r, Q_r):
       E_ij = K/(4π) * [
           q_s*q_r*T0
         + (q_s*(μ_r·R̂) - q_r*(μ_s·R̂)) * T'
         + (μ_s·μ_r) * T'/r
         + (μ_s·R̂)*(μ_r·R̂) * (T'' - T'/r)
+        + charge-quadrupole terms
+        + dipole-quadrupole terms
+        + quadrupole-quadrupole terms
       ]
     with R = r_j - r_i, r = |R|, R̂ = R/r.
     """
@@ -488,24 +553,75 @@ def multipole_energy_from_graph(
 
     T0, fp, fpp = _smeared_coulomb_kernels(r_safe, sigma)
     fp_over_r = fp / r_safe
+    g = torch.exp(-r_safe.pow(2) / (4.0 * sigma ** 2)) / (sigma * math.sqrt(math.pi))
+    fppp = _smeared_coulomb_third_derivative(r_safe, torch.as_tensor(sigma, dtype=r_safe.dtype, device=r_safe.device), g, T0)
+    f4 = _smeared_coulomb_fourth_derivative(r_safe, torch.as_tensor(sigma, dtype=r_safe.dtype, device=r_safe.device), g, T0)
 
     q_s = source_feats[sender, 0]
     q_r = source_feats[receiver, 0]
-    # e3nn SH l=1 order is [m=-1,0,+1] = [y,z,x]; reorder to Cartesian [x,y,z]
-    idx = source_feats.new_tensor([3, 1, 2], dtype=torch.long)
-    mu_s = source_feats[sender][:, idx]               # [n_edges, 3]: (μ_x, μ_y, μ_z)
-    mu_r = source_feats[receiver][:, idx]
+    pair_energy = q_s * q_r * T0
 
-    mu_s_Rhat = (mu_s * Rhat).sum(-1)
-    mu_r_Rhat = (mu_r * Rhat).sum(-1)
-    mu_dot = (mu_s * mu_r).sum(-1)
+    if source_feats.shape[-1] >= 4:
+        # e3nn SH l=1 order is [m=-1,0,+1] = [y,z,x]; reorder to Cartesian [x,y,z]
+        idx = source_feats.new_tensor([3, 1, 2], dtype=torch.long)
+        mu_s = source_feats[sender][:, idx]
+        mu_r = source_feats[receiver][:, idx]
 
-    pair_energy = (
-        q_s * q_r * T0
-        + (q_s * mu_r_Rhat - q_r * mu_s_Rhat) * fp
-        - fp_over_r * mu_dot
-        + (fp_over_r - fpp) * mu_s_Rhat * mu_r_Rhat
-    )
+        mu_s_Rhat = (mu_s * Rhat).sum(-1)
+        mu_r_Rhat = (mu_r * Rhat).sum(-1)
+        mu_dot = (mu_s * mu_r).sum(-1)
+
+        pair_energy = pair_energy + (
+            (q_s * mu_r_Rhat - q_r * mu_s_Rhat) * fp
+            - fp_over_r * mu_dot
+            + (fp_over_r - fpp) * mu_s_Rhat * mu_r_Rhat
+        )
+    else:
+        mu_s = mu_r = mu_s_Rhat = mu_r_Rhat = None
+
+    if source_feats.shape[-1] >= 9:
+        quad_s = _l2_source_to_cartesian(source_feats[sender][:, 4:9])
+        quad_r = _l2_source_to_cartesian(source_feats[receiver][:, 4:9])
+
+        quad_s_Rhat = torch.einsum("eab,eb->ea", quad_s, Rhat)
+        quad_r_Rhat = torch.einsum("eab,eb->ea", quad_r, Rhat)
+        quad_s_nn = torch.einsum("ea,ea->e", quad_s_Rhat, Rhat)
+        quad_r_nn = torch.einsum("ea,ea->e", quad_r_Rhat, Rhat)
+
+        hess_aniso = fpp - fp_over_r
+        third_radial = fppp - 3.0 * fpp / r_safe + 3.0 * fp / r_safe.pow(2)
+        third_mixed = fpp / r_safe - fp / r_safe.pow(2)
+        fourth_radial = (
+            f4
+            - 6.0 * fppp / r_safe
+            + 15.0 * fpp / r_safe.pow(2)
+            - 15.0 * fp / r_safe.pow(3)
+        )
+
+        pair_energy = pair_energy + hess_aniso * (
+            q_r * quad_s_nn + q_s * quad_r_nn
+        )
+
+        if mu_s is not None and mu_r is not None:
+            pair_energy = pair_energy + third_radial * (
+                mu_r_Rhat * quad_s_nn - mu_s_Rhat * quad_r_nn
+            ) + 2.0 * third_mixed * (
+                torch.einsum("ea,ea->e", mu_r, quad_s_Rhat)
+                - torch.einsum("ea,ea->e", mu_s, quad_r_Rhat)
+            )
+
+        pair_energy = pair_energy + fourth_radial * quad_s_nn * quad_r_nn
+        pair_energy = pair_energy + 4.0 * third_radial / r_safe * torch.einsum(
+            "ea,eab,eb->e",
+            Rhat,
+            torch.matmul(quad_r, quad_s),
+            Rhat,
+        )
+        pair_energy = pair_energy + 2.0 * hess_aniso / r_safe.pow(2) * torch.einsum(
+            "eab,eab->e",
+            quad_r,
+            quad_s,
+        )
 
     edge_energy = 0.5 * FIELD_CONSTANT / (4.0 * pi) * pair_energy
     node_energies = scatter_sum(src=edge_energy, index=receiver, dim=0,
@@ -517,11 +633,11 @@ def multipole_energy_from_graph(
 
 class RealSpaceAnalyticalEnergy(torch.nn.Module):
     """
-    Analytical real-space electrostatic energy for l=0,1 GTO charge densities.
+    Analytical real-space electrostatic energy for l=0,1,2 GTO charge densities.
 
     Replaces RealSpaceFiniteDiffereneEnergy: no finite-difference offset, no
-    ghost atoms — computes charge/charge, charge/dipole, and dipole/dipole
-    interactions directly from the smeared Coulomb kernel and its derivatives.
+    ghost atoms — computes charge, dipole, and quadrupole interactions
+    directly from the smeared Coulomb kernel and its derivatives.
     """
 
     def __init__(
@@ -530,9 +646,10 @@ class RealSpaceAnalyticalEnergy(torch.nn.Module):
         density_smearing_width: float,
         include_self_interaction: bool = False,
     ):
-        if density_max_l > 1:
-            raise ValueError("RealSpaceAnalyticalEnergy only supports l=0 and l=1.")
+        if density_max_l > 2:
+            raise ValueError("RealSpaceAnalyticalEnergy only supports l=0, l=1, and l=2.")
         super().__init__()
+        GTOSelfInteractionBlock, _ = _load_gto_utils()
         self.density_max_l = density_max_l
         self.density_smearing_width = density_smearing_width
         self.include_self_interaction = include_self_interaction
@@ -585,7 +702,7 @@ class RealSpaceAnalyticalEnergy(torch.nn.Module):
 # ---------------------------------------------------------------------------
 
 def multipole_features_from_graph(
-    source_feats: torch.Tensor,     # [n_nodes, 1] (l=0) or [n_nodes, 4] (l=1)
+    source_feats: torch.Tensor,     # [n_nodes, 1] (l=0), [n_nodes, 4] (l=1), or [n_nodes, 9] (l=2 source)
     positions: torch.Tensor,        # [n_nodes, 3]
     edge_index: torch.Tensor,       # [2, n_edges]
     total_width_factors: torch.Tensor,  # [n_radial]  w_s = sqrt((s_src^2+s_proj_s^2)/2)
@@ -604,6 +721,11 @@ def multipole_features_from_graph(
 
       l=1_a from q_j:   -K/4pi * q_j * fp_s * Rhat_a
       l=1_a from mu_j:  -K/4pi * [fp_over_r*mu_j^a - (fp_over_r-fpp)*(mu_j.Rhat)*Rhat_a]
+      l=0 from Q_j:    +K/4pi * (Q_j : RhatRhat) * (fpp - fp/r)
+      l=1_a from Q_j:  +K/4pi * [
+                          2 * (fpp/r - fp/r^2) * (Q_j Rhat)_a
+                          + (f''' - 3f''/r + 3f'/r^2) * (Q_j : RhatRhat) * Rhat_a
+                        ]
 
     Output shape: [n_nodes, n_radial] (proj l=0) or [n_nodes, 4*n_radial] (proj l=1).
     """
@@ -626,6 +748,9 @@ def multipole_features_from_graph(
     g_s = torch.exp(-r_e.pow(2) / (4.0 * w.pow(2))) / (w * math.sqrt(math.pi))
     T_s = torch.erf(r_e / (2.0 * w)) / r_e
     fp_s = (g_s - T_s) / r_e
+    fp_over_r = fp_s / r_e
+    fpp_s = -g_s / (2.0 * w.pow(2)) - 2.0 * g_s / r_e.pow(2) + 2.0 * T_s / r_e.pow(2)
+    fppp_s = _smeared_coulomb_third_derivative(r_e, w, g_s, T_s)
 
     q_j = source_feats[sender, 0]                  # [n_edges]
 
@@ -638,6 +763,13 @@ def multipole_features_from_graph(
         mu_Rhat = (mu_j * Rhat).sum(-1)             # [n_edges]
         contrib_l0 = contrib_l0 - mu_Rhat.unsqueeze(-1) * fp_s
 
+    if density_max_l >= 2:
+        quad_j = _l2_source_to_cartesian(source_feats[sender][:, 4:9])   # [n_edges, 3, 3]
+        quad_Rhat = torch.einsum("eab,eb->ea", quad_j, Rhat)              # [n_edges, 3]
+        quad_nn = torch.einsum("ea,ea->e", quad_Rhat, Rhat)               # [n_edges]
+        hess_aniso = fpp_s - fp_over_r
+        contrib_l0 = contrib_l0 + quad_nn.unsqueeze(-1) * hess_aniso
+
     feat_l0 = scatter_sum(
         contrib_l0, receiver, dim=0,
         out=torch.zeros(n_nodes, num_radial, dtype=contrib_l0.dtype, device=contrib_l0.device),
@@ -648,8 +780,6 @@ def multipole_features_from_graph(
         return feat_l0
 
     # l=1 gradient contributions per edge  [n_edges, n_radial, 3]
-    fp_over_r = fp_s / r_e
-    fpp_s = -g_s / (2.0 * w.pow(2)) - 2.0 * g_s / r_e.pow(2) + 2.0 * T_s / r_e.pow(2)
 
     # from charge q_j:  dV/dr_i = fp_s * Rhat_a * q_j  → [n_edges, n_radial, 3]
     contrib_l1 = fp_s.unsqueeze(-1) * Rhat.unsqueeze(-2) * q_j.unsqueeze(-1).unsqueeze(-1)
@@ -663,6 +793,15 @@ def multipole_features_from_graph(
             * Rhat.unsqueeze(-2)
         )
         contrib_l1 = contrib_l1 + dip_iso + dip_aniso
+
+    if density_max_l >= 2:
+        quad_mix = 2.0 * (fpp_s / r_e - fp_s / r_e.pow(2))               # [n_edges, n_radial]
+        quad_radial = fppp_s - 3.0 * fpp_s / r_e + 3.0 * fp_s / r_e.pow(2)
+        quad_vec = (
+            quad_mix.unsqueeze(-1) * quad_Rhat.unsqueeze(-2)
+            + (quad_radial * quad_nn.unsqueeze(-1)).unsqueeze(-1) * Rhat.unsqueeze(-2)
+        )
+        contrib_l1 = contrib_l1 + quad_vec
 
     feat_l1 = scatter_sum(
         contrib_l1.reshape(contrib_l1.shape[0], -1),
@@ -689,6 +828,9 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
     Replaces the 7-ghost-atom FD scheme with direct evaluation of the
     smeared Coulomb potential and its gradient at each receiver site.
     Reduces edges from O(49 N^2) to O(2 N^2) with no offset hyperparameter.
+
+    Supports source multipoles up to l=2 (charges, dipoles, quadrupoles) and
+    receiver projections up to l=1 (potential + electric-field-like features).
     """
 
     def __init__(
@@ -700,9 +842,12 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
         include_self_interaction: bool = False,
         integral_normalization: str = "receiver",
     ):
-        if density_max_l > 1 or projection_max_l > 1:
-            raise ValueError("RealSpaceAnalyticalElectrostaticFeatures supports l<=1 only.")
+        if density_max_l > 2 or projection_max_l > 1:
+            raise ValueError(
+                "RealSpaceAnalyticalElectrostaticFeatures supports density_max_l<=2 and projection_max_l<=1."
+            )
         super().__init__()
+        GTOSelfInteractionBlock, get_Cl_sigma = _load_gto_utils()
         self.density_max_l = density_max_l
         self.projection_max_l = projection_max_l
         self.include_self_interaction = include_self_interaction
@@ -771,4 +916,3 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
             features = features + si_terms
 
         return features, si_terms, None
-

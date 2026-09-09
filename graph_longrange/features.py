@@ -489,12 +489,14 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         )
 
     def forward_dynamic(
-        self, cache: dict, source_feats: torch.Tensor, pbc: torch.Tensor
+        self, cache: dict, source_feats: torch.Tensor, pbc: torch.Tensor,
+        n_graphs: int | None = None,
     ) -> torch.Tensor:
         if cache.get("mode") == "realspace":
             return self._realspace_forward_dynamic(
                 source_feats=source_feats,
                 cache=cache,
+                n_graphs=n_graphs,
             )
         return self._pbc_forward_dynamic(
             source_feats=source_feats,
@@ -555,15 +557,68 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         }
 
     def _realspace_forward_dynamic(
-        self, source_feats: torch.Tensor, cache: dict
+        self, source_feats: torch.Tensor, cache: dict,
+        n_graphs: int | None = None,
     ) -> torch.Tensor:
         features, _, _ = self.realspace_features(
             source_feats=source_feats,
             node_positions=cache["node_positions"],
             batch=cache["batch"],
+            n_graphs=n_graphs,
         )
         return features
 
+
+    def _pbc_precompute_static(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        volume: torch.Tensor,
+        pbc: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> dict:
+        """Cell/topology-dependent quantities — recompute only when cell or topology changes."""
+        density_basis_fs = self.density_basis(k_vectors, k_norm2, k0_mask)
+        feature_basis_fs = self.feature_basis(k_vectors, k_norm2, k0_mask)
+
+        volume_per_k = volume.reshape(-1)[k_vector_batch]
+        k0_mask_bool = k0_mask > 0.0
+        k_factor_coulomb = torch.zeros_like(k_norm2)
+        k_factor_coulomb[~k0_mask_bool] = 1.0 / k_norm2[~k0_mask_bool]
+        k_factor_proj = torch.ones_like(k_norm2)
+        k_factor_proj[k0_mask_bool] = 0.5
+
+        mask_f = (k_vector_batch[:, None] == batch[None, :]).to(dtype=density_basis_fs.dtype)
+        correction_cache = self._build_correction_cache(pbc=pbc, batch=batch)
+
+        return {
+            "mode": "pbc",
+            "k_vectors": k_vectors,
+            "k_norm2": k_norm2,
+            "k_vector_batch": k_vector_batch,
+            "k0_mask": k0_mask,
+            "volume_per_k": volume_per_k,
+            "k_factor_coulomb": k_factor_coulomb,
+            "k_factor_proj": k_factor_proj,
+            "density_basis_fs": density_basis_fs,
+            "feature_basis_fs": feature_basis_fs,
+            "mask_f": mask_f,
+            "volumes": volume.reshape(-1),
+            "batch": batch,
+            "pbc": pbc,
+            **correction_cache,
+        }
+
+    def _pbc_update_positions(
+        self, node_positions: torch.Tensor, static_cache: dict
+    ) -> dict:
+        """Position-dependent update — cheap per-step cost, only recomputes cosines/sines."""
+        inner_products = torch.matmul(static_cache["k_vectors"], node_positions.t())
+        cosines = torch.cos(inner_products) * static_cache["mask_f"]
+        sines = torch.sin(inner_products) * static_cache["mask_f"]
+        return {**static_cache, "node_positions": node_positions, "cosines": cosines, "sines": sines}
 
     def _pbc_precompute_geometry(
         self,
@@ -576,43 +631,10 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         volume: torch.Tensor,
         pbc: torch.Tensor,
     ) -> dict:
-        inner_products = torch.matmul(k_vectors, node_positions.t())  # [n_k_total, n_nodes]
-        mask = k_vector_batch[:, None] == batch[None, :]
-        mask_f = mask.to(dtype=inner_products.dtype)
-        cosines = torch.cos(inner_products) * mask_f
-        sines = torch.sin(inner_products) * mask_f
-
-        density_basis_fs = self.density_basis(k_vectors, k_norm2, k0_mask)
-        feature_basis_fs = self.feature_basis(k_vectors, k_norm2, k0_mask)
-
-        volume_per_k = volume.reshape(-1)[k_vector_batch]
-        k0_mask_bool = k0_mask > 0.0
-        k_factor_coulomb = torch.zeros_like(k_norm2)
-        k_factor_coulomb[~k0_mask_bool] = 1.0 / k_norm2[~k0_mask_bool]
-        k_factor_proj = torch.ones_like(k_norm2)
-        k_factor_proj[k0_mask_bool] = 0.5
-
-        correction_cache = self._build_correction_cache(pbc=pbc, batch=batch)
-
-        return {
-            "mode": "pbc",
-            "k_vectors": k_vectors,
-            "k_norm2": k_norm2,
-            "k_vector_batch": k_vector_batch,
-            "k0_mask": k0_mask,
-            "volume_per_k": volume_per_k,
-            "k_factor_coulomb": k_factor_coulomb,
-            "k_factor_proj": k_factor_proj,
-            "volumes": volume.reshape(-1),
-            "batch": batch,
-            "node_positions": node_positions,
-            "pbc": pbc,
-            "cosines": cosines,
-            "sines": sines,
-            "density_basis_fs": density_basis_fs,
-            "feature_basis_fs": feature_basis_fs,
-            **correction_cache,
-        }
+        static = self._pbc_precompute_static(
+            k_vectors, k_norm2, k_vector_batch, k0_mask, volume, pbc, batch
+        )
+        return self._pbc_update_positions(node_positions, static)
 
     def _pbc_forward_dynamic(self, source_feats: torch.Tensor, cache: dict) -> torch.Tensor:
         density = assemble_fourier_series_batch(
@@ -834,12 +856,14 @@ class GTOElectrostaticFeaturesMultiChannel(torch.nn.Module):
         )
 
     def forward_dynamic(
-        self, cache: dict, source_feats: torch.Tensor, pbc: torch.Tensor
+        self, cache: dict, source_feats: torch.Tensor, pbc: torch.Tensor,
+        n_graphs: int | None = None,
     ) -> torch.Tensor:
         if cache.get("mode") == "realspace":
             return self._realspace_forward_dynamic(
                 source_feats=source_feats,
                 cache=cache,
+                n_graphs=n_graphs,
             )
         return self._pbc_forward_dynamic(
             source_feats=source_feats,
@@ -858,7 +882,8 @@ class GTOElectrostaticFeaturesMultiChannel(torch.nn.Module):
         }
 
     def _realspace_forward_dynamic(
-        self, source_feats: torch.Tensor, cache: dict
+        self, source_feats: torch.Tensor, cache: dict,
+        n_graphs: int | None = None,
     ) -> torch.Tensor:
         source_feats = self._ensure_channel_dim(source_feats)
         n_nodes, n_channels, m_dim = source_feats.shape
@@ -870,9 +895,61 @@ class GTOElectrostaticFeaturesMultiChannel(torch.nn.Module):
             source_feats=source_flat,
             node_positions=node_positions,
             batch=batch,
+            n_graphs=n_graphs,
         )
         features = features.reshape(n_nodes, n_channels, -1)
         return features
+
+    def _pbc_precompute_static(
+        self,
+        k_vectors: torch.Tensor,
+        k_norm2: torch.Tensor,
+        k_vector_batch: torch.Tensor,
+        k0_mask: torch.Tensor,
+        volume: torch.Tensor,
+        pbc: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> dict:
+        """Cell/topology-dependent quantities — recompute only when cell or topology changes."""
+        density_basis_fs = self.density_basis(k_vectors, k_norm2, k0_mask)
+        feature_basis_fs = self.feature_basis(k_vectors, k_norm2, k0_mask)
+
+        volume_per_k = volume.reshape(-1)[k_vector_batch]
+        k0_mask_bool = k0_mask > 0.0
+        k_factor_coulomb = torch.zeros_like(k_norm2)
+        k_factor_coulomb[~k0_mask_bool] = 1.0 / k_norm2[~k0_mask_bool]
+        k_factor_proj = torch.ones_like(k_norm2)
+        k_factor_proj[k0_mask_bool] = 0.5
+
+        mask_f = (k_vector_batch[:, None] == batch[None, :]).to(dtype=density_basis_fs.dtype)
+        correction_cache = self._build_correction_cache(pbc=pbc, batch=batch)
+
+        return {
+            "mode": "pbc",
+            "k_vectors": k_vectors,
+            "k_norm2": k_norm2,
+            "k_vector_batch": k_vector_batch,
+            "k0_mask": k0_mask,
+            "volume_per_k": volume_per_k,
+            "k_factor_coulomb": k_factor_coulomb,
+            "k_factor_proj": k_factor_proj,
+            "density_basis_fs": density_basis_fs,
+            "feature_basis_fs": feature_basis_fs,
+            "mask_f": mask_f,
+            "volumes": volume.reshape(-1),
+            "batch": batch,
+            "pbc": pbc,
+            **correction_cache,
+        }
+
+    def _pbc_update_positions(
+        self, node_positions: torch.Tensor, static_cache: dict
+    ) -> dict:
+        """Position-dependent update — cheap per-step cost, only recomputes cosines/sines."""
+        inner_products = torch.matmul(static_cache["k_vectors"], node_positions.t())
+        cosines = torch.cos(inner_products) * static_cache["mask_f"]
+        sines = torch.sin(inner_products) * static_cache["mask_f"]
+        return {**static_cache, "node_positions": node_positions, "cosines": cosines, "sines": sines}
 
     def _pbc_precompute_geometry(
         self,
@@ -885,43 +962,10 @@ class GTOElectrostaticFeaturesMultiChannel(torch.nn.Module):
         volume: torch.Tensor,
         pbc: torch.Tensor,
     ) -> dict:
-        inner_products = torch.matmul(k_vectors, node_positions.t())  # [n_k_total, n_nodes]
-        mask = k_vector_batch[:, None] == batch[None, :]
-        mask_f = mask.to(dtype=inner_products.dtype)
-        cosines = torch.cos(inner_products) * mask_f
-        sines = torch.sin(inner_products) * mask_f
-
-        density_basis_fs = self.density_basis(k_vectors, k_norm2, k0_mask)
-        feature_basis_fs = self.feature_basis(k_vectors, k_norm2, k0_mask)
-
-        volume_per_k = volume.reshape(-1)[k_vector_batch]
-        k0_mask_bool = k0_mask > 0.0
-        k_factor_coulomb = torch.zeros_like(k_norm2)
-        k_factor_coulomb[~k0_mask_bool] = 1.0 / k_norm2[~k0_mask_bool]
-        k_factor_proj = torch.ones_like(k_norm2)
-        k_factor_proj[k0_mask_bool] = 0.5
-
-        correction_cache = self._build_correction_cache(pbc=pbc, batch=batch)
-
-        return {
-            "mode": "pbc",
-            "k_vectors": k_vectors,
-            "k_norm2": k_norm2,
-            "k_vector_batch": k_vector_batch,
-            "k0_mask": k0_mask,
-            "volume_per_k": volume_per_k,
-            "k_factor_coulomb": k_factor_coulomb,
-            "k_factor_proj": k_factor_proj,
-            "volumes": volume.reshape(-1),
-            "batch": batch,
-            "node_positions": node_positions,
-            "pbc": pbc,
-            "cosines": cosines,
-            "sines": sines,
-            "density_basis_fs": density_basis_fs,
-            "feature_basis_fs": feature_basis_fs,
-            **correction_cache,
-        }
+        static = self._pbc_precompute_static(
+            k_vectors, k_norm2, k_vector_batch, k0_mask, volume, pbc, batch
+        )
+        return self._pbc_update_positions(node_positions, static)
 
     def _pbc_forward_dynamic(self, source_feats: torch.Tensor, cache: dict) -> torch.Tensor:
         source_feats = self._ensure_channel_dim(source_feats)

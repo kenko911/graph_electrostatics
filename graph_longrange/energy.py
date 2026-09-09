@@ -79,6 +79,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         volume: torch.Tensor,
         pbc: torch.Tensor,
         force_pbc_evaluator: bool = False,
+        n_graphs: int | None = None,
     ) -> torch.Tensor:
         if torch.any(pbc) or force_pbc_evaluator:
             return self._pbc_energy_batch(
@@ -96,6 +97,7 @@ class GTOElectrostaticEnergy(torch.nn.Module):
             source_feats=source_feats,
             node_positions=node_positions,
             batch=batch,
+            n_graphs=n_graphs,
         )
 
     def _realspace_energy(
@@ -103,11 +105,13 @@ class GTOElectrostaticEnergy(torch.nn.Module):
         source_feats: torch.Tensor,
         node_positions: torch.Tensor,
         batch: torch.Tensor,
+        n_graphs: int | None = None,
     ) -> torch.Tensor:
         return self.realspace_energy(
             source_feats=source_feats,
             positions=node_positions,
             batch=batch,
+            n_graphs=n_graphs,
         )
 
     def _pbc_energy_batch(

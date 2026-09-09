@@ -35,22 +35,27 @@ def _is_batch1(batch: torch.Tensor) -> bool:
 
 
 def _get_total_dipole_z(
-    source_feats: torch.Tensor, node_positions: torch.Tensor, batch: torch.Tensor
+    source_feats: torch.Tensor, node_positions: torch.Tensor, batch: torch.Tensor,
+    n_graphs: int | None = None,
 ) -> torch.Tensor:
     charges = source_feats[:, 0]
-    if _is_batch1(batch):
+    # Use n_graphs if provided (compile-friendly: avoids batch.max().item()).
+    # Fall back to _is_batch1 only in eager mode when n_graphs is not supplied.
+    is_single = (n_graphs == 1) if n_graphs is not None else _is_batch1(batch)
+    if is_single:
         total_dipole_z = (node_positions[:, 2] * charges).sum().unsqueeze(0)
         if source_feats.shape[-1] > 1:
             local_dipoles = source_feats[:, 1:4]
             total_dipole_z = total_dipole_z + local_dipoles.sum(dim=0)[1].unsqueeze(0)
         return total_dipole_z
 
+    ng = n_graphs  # concrete int (no u0)
     total_dipole_z = scatter_sum(
-        src=node_positions[:, 2] * charges, index=batch, dim=0
+        src=node_positions[:, 2] * charges, index=batch, dim=0, dim_size=ng
     )
     if source_feats.shape[-1] > 1:
         local_dipoles = source_feats[:, 1:4]
-        total_dipole_p = scatter_sum(src=local_dipoles, index=batch, dim=0)
+        total_dipole_p = scatter_sum(src=local_dipoles, index=batch, dim=0, dim_size=ng)
         total_dipole_z = total_dipole_z + total_dipole_p[:, 1]
     return total_dipole_z
 
@@ -61,7 +66,8 @@ def slab_dipole_correction_energy(
     volumes,
     batch,
 ):
-    total_dipole_z = _get_total_dipole_z(source_feats, node_positions, batch)
+    n_graphs = int(volumes.reshape(-1).shape[0])
+    total_dipole_z = _get_total_dipole_z(source_feats, node_positions, batch, n_graphs=n_graphs)
     A = FIELD_CONSTANT / (4 * pi)
     dipole_norms_squared = total_dipole_z**2
     delta_E = A * 2 * pi * dipole_norms_squared / volumes
@@ -85,7 +91,8 @@ def slab_dipole_correction_node_fields(
     volumes: torch.Tensor,
     batch: torch.Tensor,
 ):
-    total_dipole_z = _get_total_dipole_z(source_feats, node_positions, batch)
+    n_graphs = int(volumes.reshape(-1).shape[0])
+    total_dipole_z = _get_total_dipole_z(source_feats, node_positions, batch, n_graphs=n_graphs)
     A = FIELD_CONSTANT / (4 * pi)
     total_field_z = A * 4 * pi * total_dipole_z / volumes
     spread_total_field_z = torch.index_select(total_field_z, 0, batch)
@@ -116,25 +123,26 @@ class CorrectivePotentialBlock(torch.nn.Module):
         self.include_quadrupole_corrections = quadrupole_feature_corrections
 
     def forward(self, charge_coefficients, positions, volumes, batch):
+        n_graphs = int(volumes.reshape(-1).shape[0])
         # get charge, dipole, quadrupole
-        total_charge = scatter_sum(src=charge_coefficients[:, 0], index=batch, dim=-1)
+        total_charge = scatter_sum(src=charge_coefficients[:, 0], index=batch, dim=0, dim_size=n_graphs)
         q_r = positions * charge_coefficients[:, 0].unsqueeze(-1)  # [N_atoms,3]
-        total_dipole = scatter_sum(src=q_r, index=batch, dim=0)
+        total_dipole = scatter_sum(src=q_r, index=batch, dim=0, dim_size=n_graphs)
         r_squared = torch.sum(torch.square(positions), dim=-1)
         q_rr = r_squared * charge_coefficients[:, 0]
-        quadrupole = scatter_sum(src=q_rr, index=batch, dim=0)
+        quadrupole = scatter_sum(src=q_rr, index=batch, dim=0, dim_size=n_graphs)
 
         # extra if L>0
         if self.density_max_l > 0:
             local_dipoles_cartesian = charge_coefficients[..., [3, 1, 2]]
-            total_dipole += scatter_sum(
-                src=local_dipoles_cartesian, index=batch, dim=-2
+            total_dipole = total_dipole + scatter_sum(
+                src=local_dipoles_cartesian, index=batch, dim=0, dim_size=n_graphs
             )
             positions_normed = positions / (
                 torch.norm(positions, dim=-1, keepdim=True) + 1e-3
             )
             p_dot_r = torch.einsum("bi,bi->b", positions, local_dipoles_cartesian)
-            quadrupole += 2 * scatter_sum(src=p_dot_r, index=batch, dim=0)
+            quadrupole = quadrupole + 2 * scatter_sum(src=p_dot_r, index=batch, dim=0, dim_size=n_graphs)
 
         spread_dipoles = torch.index_select(total_dipole, 0, batch)
         spread_total_charge = torch.index_select(total_charge, 0, batch)
@@ -211,30 +219,31 @@ class MonopoleDipoleCorrectionBlock(torch.nn.Module):
         volumes,
         batch,
     ):
+        n_graphs = int(volumes.reshape(-1).shape[0])
         # get charge
-        total_charge = scatter_sum(src=charge_coefficients[:, 0], index=batch, dim=-1)
+        total_charge = scatter_sum(src=charge_coefficients[:, 0], index=batch, dim=0, dim_size=n_graphs)
         charge_norms_squared = torch.square(total_charge)
 
         # get dipole
         q_r = positions * charge_coefficients[:, 0].unsqueeze(-1)  # [N_atoms,3]
-        total_dipole = scatter_sum(src=q_r, index=batch, dim=0)
+        total_dipole = scatter_sum(src=q_r, index=batch, dim=0, dim_size=n_graphs)
 
         # get isotropic quadrupole
         r_squared = torch.sum(torch.square(positions), dim=-1)
         q_rr = r_squared * charge_coefficients[:, 0]
-        quadrupole = scatter_sum(src=q_rr, index=batch, dim=0)
+        quadrupole = scatter_sum(src=q_rr, index=batch, dim=0, dim_size=n_graphs)
 
         # extra if L>0
         if self.density_max_l > 0:
             local_dipoles_cartesian = charge_coefficients[..., [3, 1, 2]]
-            total_dipole += scatter_sum(
-                src=local_dipoles_cartesian, index=batch, dim=-2
+            total_dipole = total_dipole + scatter_sum(
+                src=local_dipoles_cartesian, index=batch, dim=0, dim_size=n_graphs
             )
             positions_normed = positions / (
                 torch.norm(positions, dim=-1, keepdim=True) + 1e-3
             )
             p_dot_r = torch.einsum("bi,bi->b", positions, local_dipoles_cartesian)
-            quadrupole += 2 * scatter_sum(src=p_dot_r, index=batch, dim=0)
+            quadrupole = quadrupole + 2 * scatter_sum(src=p_dot_r, index=batch, dim=0, dim_size=n_graphs)
 
         # charge correction
         Ls = torch.pow(volumes, 0.3333)

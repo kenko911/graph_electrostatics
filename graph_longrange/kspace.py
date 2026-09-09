@@ -5,7 +5,6 @@ from .utils import (
 )
 import torch
 from scipy.constants import pi
-from e3nn import o3, nn
 
 
 def compute_k_vectors_flat(

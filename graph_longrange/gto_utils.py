@@ -11,13 +11,20 @@ from .utils import FIELD_CONSTANT
 
 
 class RadialIntegralDirect(torch.nn.Module):
-    """Direct evaluation of f_{nl}(k) for max_l <= 1."""
+    """Direct evaluation of the GTO radial Fourier integral f_l(k) for max_l <= 2.
+
+    The analytic result for a source density r^l * exp(-r^2 / 2*sigma^2) is:
+
+        f_l(k) = 4*pi * sqrt(pi/2) * sigma^(2l+3) * k^l * exp(-k^2 * sigma^2 / 2)
+
+    giving pref_l = pref_const * sigma^(2l+3) with k^l as the momentum factor.
+    """
 
     def __init__(self, sigmas: Sequence[float], max_l: int, k_space_cutoff: float):
         super().__init__()
-        if max_l > 1:
+        if max_l > 2:
             raise NotImplementedError(
-                "RadialIntegralDirect only supports max_l <= 1."
+                "RadialIntegralDirect only supports max_l <= 2."
             )
         self.num_sigma = len(sigmas)
         self.max_l = max_l
@@ -27,26 +34,26 @@ class RadialIntegralDirect(torch.nn.Module):
 
         self.register_buffer("sigma2", sigmas_t * sigmas_t)
         self.register_buffer("pref0", pref_const * sigmas_t ** 3)
-        if max_l == 1:
+        if max_l >= 1:
             self.register_buffer("pref1", pref_const * sigmas_t ** 5)
+        if max_l >= 2:
+            self.register_buffer("pref2", pref_const * sigmas_t ** 7)
 
     def forward(self, k_mods: torch.Tensor) -> torch.Tensor:
         k2 = k_mods * k_mods
         exp_term = torch.exp(-0.5 * k2.unsqueeze(-1) * self.sigma2)
 
         if self.max_l == 0:
-            out = self.pref0 * exp_term
-            return out.unsqueeze(-1)
+            return (self.pref0 * exp_term).unsqueeze(-1)
 
-        out = torch.empty(
-            (*k_mods.shape, self.num_sigma, 2),
-            dtype=k_mods.dtype,
-            device=k_mods.device,
-        )
         out0 = self.pref0 * exp_term
         out1 = self.pref1 * k_mods.unsqueeze(-1) * exp_term
-        out = torch.stack([out0,out1], dim=-1)
-        return out
+
+        if self.max_l == 1:
+            return torch.stack([out0, out1], dim=-1)
+
+        out2 = self.pref2 * k2.unsqueeze(-1) * exp_term
+        return torch.stack([out0, out1, out2], dim=-1)
 
 
 def _normalization_denominator(

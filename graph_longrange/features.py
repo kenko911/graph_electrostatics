@@ -11,7 +11,10 @@ import torch
 from scipy.constants import pi
 
 from .gto_utils import GTOBasis, GTOSelfInteractionBlock, GTOInternalFieldtoFeaturesBlock
-from .realspace_electrostatics import RealSpaceAnalyticalElectrostaticFeatures
+from .realspace_electrostatics import (
+    RealSpaceAnalyticalElectrostaticFeatures,
+    batch_complete_graph_excluding_self_duplicates_vector,
+)
 from .slabs import (
     CorrectivePotentialBlock,
     slab_dipole_correction_node_fields,
@@ -554,6 +557,12 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             "mode": "realspace",
             "node_positions": node_positions,
             "batch": batch,
+            # Molecular electrostatics always uses the complete directed graph.
+            # It depends only on batch membership, so construct it once outside
+            # the compiled, position-dependent SCF calculation.
+            "edge_index": batch_complete_graph_excluding_self_duplicates_vector(
+                batch, 1
+            ),
         }
 
     def _realspace_forward_dynamic(
@@ -565,6 +574,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
             node_positions=cache["node_positions"],
             batch=cache["batch"],
             n_graphs=n_graphs,
+            edge_index=cache.get("edge_index"),
         )
         return features
 

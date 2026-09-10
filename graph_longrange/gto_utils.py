@@ -242,6 +242,11 @@ class GTOSelfInteractionBlock(torch.nn.Module):
 
         sh_irreps = o3.Irreps.spherical_harmonics(l_receive)
         self.features_irreps = (sh_irreps * len(sigmas_receive)).sort()[0].simplify()
+        # Keep the tensor shape as an ordinary Python integer.  Reading ``.dim``
+        # from an e3nn Irreps object in forward makes TorchDynamo guard through
+        # e3nn's Python ``Irrep.__len__`` implementation and prevents full-graph
+        # compilation of the electrostatic field calculation.
+        self.features_dim = int(self.features_irreps.dim)
 
         overlap_constants = np.zeros(
             (len(sigmas_receive) * (min(l_receive, l_source) + 1) ** 2)
@@ -302,7 +307,7 @@ class GTOSelfInteractionBlock(torch.nn.Module):
         )
 
         features = torch.zeros(
-            (charge_density.shape[0], self.features_irreps.dim),
+            (charge_density.shape[0], self.features_dim),
             device=charge_density.device,
             dtype=charge_density.dtype,
         )

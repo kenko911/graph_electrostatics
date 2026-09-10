@@ -1063,6 +1063,7 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
         node_positions: torch.Tensor,
         batch: torch.Tensor,
         n_graphs: int | None = None,
+        edge_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         feats = source_feats.squeeze(-2) if source_feats.dim() == 3 else source_feats
         # For l=0 density with l=1 projection, pad to 4 components
@@ -1073,7 +1074,10 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
             padded[:, 0] = feats[:, 0]
             feats = padded
 
-        edge_index = batch_complete_graph_excluding_self_duplicates_vector(batch, 1, n_graphs=n_graphs)
+        if edge_index is None:
+            edge_index = batch_complete_graph_excluding_self_duplicates_vector(
+                batch, 1, n_graphs=n_graphs
+            )
         features = multipole_features_from_graph(
             source_feats=feats,
             positions=node_positions,

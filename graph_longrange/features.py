@@ -344,6 +344,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         kspace_cutoff: float,
         quadrupole_feature_corrections: bool = False,
         integral_normalization: str = "receiver",
+        use_warp_kspace: bool = True,
     ):
         super().__init__()
         self.density_basis = GTOBasis(
@@ -360,6 +361,7 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         )
         self.kspace_cutoff = kspace_cutoff
         self.include_self_interaction = include_self_interaction
+        self.use_warp_kspace = use_warp_kspace
 
         self.self_interaction_terms = GTOSelfInteractionBlock(
             l_source=density_max_l,
@@ -410,6 +412,19 @@ class GTOElectrostaticFeatures(torch.nn.Module):
 
     def _permute_output_channels(self, features_flat: torch.Tensor) -> torch.Tensor:
         return torch.index_select(features_flat, dim=-1, index=self.output_permutation)
+
+    def _warp_kspace_inference_enabled(self, tensor: torch.Tensor) -> bool:
+        if not (
+            self.use_warp_kspace
+            and tensor.device.type == "cuda"
+            and not torch.is_grad_enabled()
+        ):
+            return False
+        try:
+            from .kspace_warp import _HAS_WARP
+        except ImportError:
+            return False
+        return _HAS_WARP
 
     @staticmethod
     def _build_correction_cache(pbc: torch.Tensor, batch: torch.Tensor) -> dict:
@@ -625,6 +640,8 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         self, node_positions: torch.Tensor, static_cache: dict
     ) -> dict:
         """Position-dependent update — cheap per-step cost, only recomputes cosines/sines."""
+        if self._warp_kspace_inference_enabled(node_positions):
+            return {**static_cache, "node_positions": node_positions}
         inner_products = torch.matmul(static_cache["k_vectors"], node_positions.t())
         cosines = torch.cos(inner_products) * static_cache["mask_f"]
         sines = torch.sin(inner_products) * static_cache["mask_f"]
@@ -647,25 +664,54 @@ class GTOElectrostaticFeatures(torch.nn.Module):
         return self._pbc_update_positions(node_positions, static)
 
     def _pbc_forward_dynamic(self, source_feats: torch.Tensor, cache: dict) -> torch.Tensor:
-        density = assemble_fourier_series_batch(
-            source_feats=source_feats,
-            cosines=cache["cosines"],
-            sines=cache["sines"],
-            density_basis_fs=cache["density_basis_fs"],
-            volume_per_k=cache["volume_per_k"],
-        )
+        warp_inference = self._warp_kspace_inference_enabled(source_feats)
+        if warp_inference:
+            from .kspace_warp import assemble_fourier_series_batch_warp
+
+            density = assemble_fourier_series_batch_warp(
+                source_feats=source_feats,
+                node_positions=cache["node_positions"],
+                k_vectors=cache["k_vectors"],
+                k_vector_batch=cache["k_vector_batch"],
+                batch=cache["batch"],
+                density_basis_fs=cache["density_basis_fs"],
+                volume_per_k=cache["volume_per_k"],
+                num_graphs=int(cache["volumes"].shape[0]),
+            )
+        else:
+            density = assemble_fourier_series_batch(
+                source_feats=source_feats,
+                cosines=cache["cosines"],
+                sines=cache["sines"],
+                density_basis_fs=cache["density_basis_fs"],
+                volume_per_k=cache["volume_per_k"],
+            )
         potential = apply_coulomb_kernel_batch(
             k_norm2=cache["k_norm2"],
             density=density,
             k_factor_coulomb=cache["k_factor_coulomb"],
         )
-        features_si = project_to_features_batch(
-            potential=potential,
-            feature_basis_fs=cache["feature_basis_fs"],
-            cosines=cache["cosines"],
-            sines=cache["sines"],
-            k_factor_proj=cache["k_factor_proj"],
-        )
+        if warp_inference:
+            from .kspace_warp import project_to_features_batch_warp
+
+            features_si = project_to_features_batch_warp(
+                potential=potential,
+                feature_basis_fs=cache["feature_basis_fs"],
+                node_positions=cache["node_positions"],
+                k_vectors=cache["k_vectors"],
+                k_vector_batch=cache["k_vector_batch"],
+                batch=cache["batch"],
+                num_graphs=int(cache["volumes"].shape[0]),
+                k_factor_proj=cache["k_factor_proj"],
+            )
+        else:
+            features_si = project_to_features_batch(
+                potential=potential,
+                feature_basis_fs=cache["feature_basis_fs"],
+                cosines=cache["cosines"],
+                sines=cache["sines"],
+                k_factor_proj=cache["k_factor_proj"],
+            )
         features_flat = features_si.reshape(features_si.size(0), -1)
         features_flat = self._permute_output_channels(features_flat)
 

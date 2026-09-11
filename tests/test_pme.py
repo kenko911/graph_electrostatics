@@ -325,6 +325,23 @@ class TestPMEFeatures:
         out = pme(sf, pos, batch, box, torch.tensor([[True, True, True]]))
         assert out.abs().max().item() < 1e-8
 
+    def test_fixed_cell_reciprocal_cache_is_reused_and_invalidated(self, neutral_l2_system):
+        sys = neutral_l2_system
+        model = self._pme(2, 2)
+        first = self._run_pme(model, sys)
+        cache = model._pme_reciprocal_cache
+        second = self._run_pme(model, sys)
+        assert model._pme_reciprocal_cache is cache
+        torch.testing.assert_close(second, first, atol=0, rtol=0)
+
+        changed = dict(sys)
+        changed["box"] = sys["box"].clone()
+        changed["box"][0, 0, 0] += 0.01
+        third = self._run_pme(model, changed)
+        assert model._pme_reciprocal_cache is not cache
+        fresh = self._run_pme(self._pme(2, 2), changed)
+        torch.testing.assert_close(third, fresh, atol=0, rtol=0)
+
     def test_non_pbc_falls_back(self, neutral_l1_system):
         sys = neutral_l1_system
         pme = self._pme(1, 1)

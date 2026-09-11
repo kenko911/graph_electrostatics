@@ -1,5 +1,6 @@
 import unittest
 
+import pytest
 import torch
 
 from graph_longrange.realspace_electrostatics import (
@@ -229,3 +230,40 @@ def test_gto_electrostatic_features_support_quadrupole_sources_in_realspace():
     )
 
     torch.testing.assert_close(features, reference_features, rtol=1e-7, atol=1e-9)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_fused_warp_l2_features_match_analytical(dtype, tmp_path):
+    """Exercise the CUDA inference kernel on Warp CPU and pin all l=0/1/2 channels."""
+    warp = pytest.importorskip("warp")
+    warp.config.kernel_cache_dir = str(tmp_path / "warp-realspace-cache")
+    from scipy.constants import pi
+
+    from graph_longrange.realspace_warp import fused_multipole_features_l2
+    from graph_longrange.utils import FIELD_CONSTANT
+
+    torch.manual_seed(81)
+    counts = torch.tensor([4, 3], dtype=torch.int32)
+    batch = torch.repeat_interleave(torch.arange(2), counts.to(torch.long))
+    positions = torch.randn(7, 3, dtype=dtype)
+    source = torch.randn(7, 9, dtype=dtype)
+    model = RealSpaceAnalyticalElectrostaticFeatures(2, 1.5, 2, [1.5], False, "receiver").to(dtype)
+    expected = model(source, positions, batch)[0]
+    ends = torch.cumsum(counts, 0)
+    starts = ends - counts
+    actual = fused_multipole_features_l2(
+        source,
+        positions,
+        batch,
+        starts,
+        ends,
+        model.total_width_factors[0],
+        model.l0_factors[0],
+        model.l1_weight[0],
+        model.l2_weight[0],
+        FIELD_CONSTANT / (4.0 * pi),
+    )
+    tolerance = 2e-3 if dtype == torch.float32 else 5e-8
+    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+    normalized_error = (actual - expected).abs().max() / expected.abs().max()
+    assert normalized_error < (3e-5 if dtype == torch.float32 else 3e-8)

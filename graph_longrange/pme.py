@@ -180,12 +180,14 @@ def _scatter_to_mesh(W: torch.Tensor, m_u0: torch.Tensor,
 def _spread_charges(positions: torch.Tensor, box: torch.Tensor,
                     q: torch.Tensor, p: Optional[torch.Tensor],
                     N: torch.Tensor, order: int = 6,
-                    Q: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    Q: Optional[torch.Tensor] = None,
+                    Nj: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Spread monopoles (+ optional dipoles p, + optional Cartesian quadrupoles Q) via B-splines.
 
     Density Taylor expansion: ρ = q·δ − p·∇δ + ½ Q:∇∇δ, so the mesh weights are
     W = q·W − p·∇W + ½ Q:∇∇W  (∇ w.r.t. grid coords; vectors/tensors mapped to grid by Nj)."""
-    Nj = _get_recip_vectors(N, box)
+    if Nj is None:
+        Nj = _get_recip_vectors(N, box)
     m_u0, u0 = _get_u_reference(positions, Nj, order)
     shifts = _make_stencil(order, positions.device, positions.dtype)
 
@@ -247,9 +249,11 @@ def _theta_k(N: torch.Tensor, order: int, device, dtype) -> torch.Tensor:
 
 def _interpolate_potential(phi_grid: torch.Tensor, positions: torch.Tensor,
                             box: torch.Tensor, N: torch.Tensor,
-                            want_field: bool, order: int = 6, want_hessian: bool = False):
+                            want_field: bool, order: int = 6, want_hessian: bool = False,
+                            Nj: Optional[torch.Tensor] = None):
     """Gather potential (and optionally field) at atom positions via B-spline interpolation."""
-    Nj = _get_recip_vectors(N, box)
+    if Nj is None:
+        Nj = _get_recip_vectors(N, box)
     m_u0, u0 = _get_u_reference(positions, Nj, order)
     shifts = _make_stencil(order, positions.device, positions.dtype)
 
@@ -282,6 +286,53 @@ def _interpolate_potential(phi_grid: torch.Tensor, positions: torch.Tensor,
     return phi_atoms, E_atoms, H_atoms
 
 
+def _precompute_pme_reciprocal(box: torch.Tensor, alpha: float, K: int) -> dict:
+    """Build the position/source-independent PME data for one cell."""
+    device, dtype = box.device, box.dtype
+    N = torch.full((3,), K, device=device, dtype=dtype)
+    freq = torch.fft.fftfreq(K, d=1.0 / K, device=device, dtype=dtype)
+    kpts_int = torch.stack(torch.meshgrid(freq, freq, freq, indexing="ij"), dim=-1).reshape(-1, 3)
+    box_inv = torch.linalg.inv(box).T
+    kpts = 2 * math.pi * torch.matmul(kpts_int, box_inv)
+    ksq = (kpts**2).sum(-1)
+    volume = torch.linalg.det(box).abs()
+    mask = ksq > 1e-10
+    coulomb = torch.zeros_like(ksq)
+    coulomb[mask] = (4.0 * math.pi / volume) * torch.exp(-ksq[mask] / (4.0 * alpha**2)) / ksq[mask]
+    return {
+        "N": N,
+        "Nj": _get_recip_vectors(N, box),
+        "theta_safe": _theta_k(N, order=6, device=device, dtype=dtype).abs().clamp(min=1e-10),
+        "mask": mask,
+        "coulomb": coulomb,
+    }
+
+
+def _cached_pme_reciprocal(module: nn.Module, box: torch.Tensor, alphas: list[float], K: int) -> list[list[dict]]:
+    """Reuse fixed-cell reciprocal grids while retaining live-cell stress derivatives."""
+    if box.requires_grad:
+        return [[_precompute_pme_reciprocal(cell, alpha, K) for cell in box] for alpha in alphas]
+
+    signature = (tuple(box.shape), box.dtype, box.device, int(K), tuple(float(alpha) for alpha in alphas))
+    cached = getattr(module, "_pme_reciprocal_cache", None)
+    snapshot = getattr(module, "_pme_reciprocal_box", None)
+    if cached is not None and getattr(module, "_pme_reciprocal_signature", None) == signature:
+        same_storage = (
+            getattr(module, "_pme_reciprocal_data_ptr", None) == box.data_ptr()
+            and getattr(module, "_pme_reciprocal_version", None) == getattr(box, "_version", None)
+        )
+        if same_storage or (snapshot is not None and torch.equal(snapshot, box)):
+            return cached
+
+    result = [[_precompute_pme_reciprocal(cell, alpha, K) for cell in box] for alpha in alphas]
+    module._pme_reciprocal_cache = result
+    module._pme_reciprocal_box = box.detach().clone()
+    module._pme_reciprocal_signature = signature
+    module._pme_reciprocal_data_ptr = box.data_ptr()
+    module._pme_reciprocal_version = getattr(box, "_version", None)
+    return result
+
+
 def compute_pme_single(
     coords: torch.Tensor,          # [Na, 3]
     box: torch.Tensor,             # [3, 3]
@@ -293,6 +344,7 @@ def compute_pme_single(
     want_field: bool = False,
     Q: Optional[torch.Tensor] = None,   # [Na, 3, 3] traceless Cartesian quadrupole
     want_hessian: bool = False,
+    reciprocal_cache: Optional[dict] = None,
 ) -> tuple:
     """
     PME reciprocal-space potential (and optionally field/Hessian) for one system.
@@ -311,45 +363,26 @@ def compute_pme_single(
     Q : Optional[Tensor]
         Traceless Cartesian quadrupole [Na,3,3], spread when rank >= 2.
     """
-    device, dtype = coords.device, coords.dtype
-    N = torch.tensor([K, K, K], device=device, dtype=dtype)
+    if reciprocal_cache is None:
+        reciprocal_cache = _precompute_pme_reciprocal(box, alpha, K)
+    N = reciprocal_cache["N"]
+    Nj = reciprocal_cache["Nj"]
 
     mesh = _spread_charges(coords, box, q, p if rank >= 1 else None, N,
-                           Q=Q if rank >= 2 else None)
-
-    # k-space grid
-    N_int = [K, K, K]
-    kx = torch.fft.fftfreq(K, d=1.0 / K, device=device, dtype=dtype)
-    ky = torch.fft.fftfreq(K, d=1.0 / K, device=device, dtype=dtype)
-    kz = torch.fft.fftfreq(K, d=1.0 / K, device=device, dtype=dtype)
-    kpts_int = torch.stack(
-        torch.meshgrid(kx, ky, kz, indexing="ij"), dim=-1
-    ).reshape(-1, 3)
-
-    box_inv = torch.linalg.inv(box).T
-    kpts = 2 * math.pi * torch.matmul(kpts_int, box_inv)  # [N³, 3]
-    ksq = (kpts**2).sum(-1)                               # [N³]
-
-    V = torch.linalg.det(box).abs()
+                           Q=Q if rank >= 2 else None, Nj=Nj)
 
     # Structure factor & Green's function
     S_k = torch.fft.fftn(mesh).reshape(-1)               # [N³]
-    theta = _theta_k(N, order=6, device=device, dtype=dtype)  # [N³]
-
-    C_k = torch.zeros_like(ksq)
-    mask = ksq > 1e-10
-    C_k[mask] = (4.0 * math.pi / V) * torch.exp(-ksq[mask] / (4.0 * alpha**2)) / ksq[mask]
-
-    theta_safe = theta.abs().clamp(min=1e-10)
+    mask = reciprocal_cache["mask"]
     Phi_k = torch.zeros_like(S_k)
-    Phi_k[mask] = C_k[mask] * S_k[mask] / theta_safe[mask].pow(2)
+    Phi_k[mask] = reciprocal_cache["coulomb"][mask] * S_k[mask] / reciprocal_cache["theta_safe"][mask].pow(2)
     Phi_real = torch.fft.ifftn(Phi_k.reshape(K, K, K), norm="forward").real
 
     want_field_actual = want_field or (rank >= 1)
     want_hessian_actual = want_hessian or (rank >= 2)
     phi_atoms, E_atoms, H_atoms = _interpolate_potential(
         Phi_real, coords, box, N,
-        want_field=want_field_actual, want_hessian=want_hessian_actual)
+        want_field=want_field_actual, want_hessian=want_hessian_actual, Nj=Nj)
     return phi_atoms, E_atoms, H_atoms
 
 
@@ -434,6 +467,7 @@ class PMEElectrostaticEnergy(nn.Module):
 
         n_graphs = int(volume.shape[0])
         energies = torch.zeros(n_graphs, dtype=feats.dtype, device=feats.device)
+        reciprocal = _cached_pme_reciprocal(self, box, [self.alpha], self.mesh_size)[0]
 
         for g in range(n_graphs):
             mask = batch == g
@@ -448,6 +482,7 @@ class PMEElectrostaticEnergy(nn.Module):
             phi, E_field, H = compute_pme_single(
                 pos_g, box[g], q_g, p_g, self.alpha, self.mesh_size,
                 rank=self.density_max_l, Q=Q_g,
+                reciprocal_cache=reciprocal[g],
             )
 
             # Self-correction (PME Gaussian convention)
@@ -616,6 +651,7 @@ class PMEElectrostaticFeatures(nn.Module):
         # batch.max().item() (an unbacked symint) so this compiles without a graph break.
         n_graphs = int(box.shape[0])
         s3 = math.sqrt(3.0)
+        reciprocal = _cached_pme_reciprocal(self, box, self.alphas, self.mesh_size)
 
         for s_idx, alpha_s in enumerate(self.alphas):
             for g in range(n_graphs):
@@ -634,6 +670,7 @@ class PMEElectrostaticFeatures(nn.Module):
                     rank=self.density_max_l, Q=Q_g,
                     want_field=(self.feature_max_l >= 1),
                     want_hessian=(self.feature_max_l >= 2),
+                    reciprocal_cache=reciprocal[s_idx][g],
                 )
 
                 # Self-correction for the potential: remove on-site contribution.

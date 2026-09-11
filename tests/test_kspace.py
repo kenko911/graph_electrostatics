@@ -675,3 +675,44 @@ class TestKSpaceFunctions:
 
         # [n_nodes, n_sigma=1, lm_dim=1] for l=0
         assert features.shape == (n, 1, 1)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_warp_kspace_reductions_match_dense_reference(dtype, tmp_path):
+    warp = pytest.importorskip("warp")
+    warp.config.kernel_cache_dir = str(tmp_path / "warp-kspace-cache")
+    from graph_longrange.features import assemble_fourier_series_batch, project_to_features_batch
+    from graph_longrange.kspace_warp import assemble_fourier_series_batch_warp, project_to_features_batch_warp
+
+    torch.manual_seed(82)
+    n_atoms, n_k, channels = 6, 11, 9
+    positions = torch.randn(n_atoms, 3, dtype=dtype)
+    k_vectors = torch.randn(n_k, 3, dtype=dtype)
+    source = torch.randn(n_atoms, 1, channels, dtype=dtype)
+    density_basis = torch.randn(n_k, 1, channels, 2, dtype=dtype)
+    feature_basis = torch.randn_like(density_basis)
+    volume_per_k = torch.rand(n_k, dtype=dtype) + 2
+    k_batch = torch.zeros(n_k, dtype=torch.long)
+    batch = torch.zeros(n_atoms, dtype=torch.long)
+    phase = k_vectors @ positions.T
+
+    expected_density = assemble_fourier_series_batch(
+        source, phase.cos(), phase.sin(), density_basis, volume_per_k
+    )
+    actual_density = assemble_fourier_series_batch_warp(
+        source, positions, k_vectors, k_batch, batch, density_basis, volume_per_k, 1
+    )
+    potential = torch.randn(n_k, 2, dtype=dtype)
+    factor = torch.rand(n_k, dtype=dtype)
+    expected_features = project_to_features_batch(
+        potential, feature_basis, phase.cos(), phase.sin(), factor
+    )
+    actual_features = project_to_features_batch_warp(
+        potential, feature_basis, positions, k_vectors, k_batch, batch, 1, factor
+    )
+
+    tolerance = 3e-4 if dtype == torch.float32 else 5e-13
+    torch.testing.assert_close(actual_density, expected_density, atol=tolerance, rtol=tolerance)
+    torch.testing.assert_close(actual_features, expected_features, atol=tolerance, rtol=tolerance)
+    normalized_density_error = (actual_density - expected_density).abs().max() / expected_density.abs().max()
+    assert normalized_density_error < (4e-7 if dtype == torch.float32 else 1e-14)

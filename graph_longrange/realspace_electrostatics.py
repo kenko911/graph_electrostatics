@@ -1066,6 +1066,39 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
         edge_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         feats = source_feats.squeeze(-2) if source_feats.dim() == 3 else source_feats
+        fused_cuda_inference = (
+            feats.device.type == "cuda"
+            and not torch.is_grad_enabled()
+            and self.density_max_l == 2
+            and self.projection_max_l == 2
+            and self.num_radial == 1
+        )
+        if fused_cuda_inference:
+            try:
+                from .realspace_warp import fused_multipole_features_l2
+            except ImportError:
+                fused_cuda_inference = False
+
+        if fused_cuda_inference:
+            n_graphs_fast = n_graphs if n_graphs is not None else (int(batch[-1]) + 1 if batch.numel() else 1)
+            counts = torch.bincount(batch, minlength=n_graphs_fast).to(torch.int32)
+            ends = torch.cumsum(counts, dim=0).to(torch.int32)
+            starts = ends - counts
+            features = fused_multipole_features_l2(
+                feats,
+                node_positions,
+                batch,
+                starts,
+                ends,
+                self.total_width_factors[0],
+                self.l0_factors[0],
+                self.l1_weight[0],
+                self.l2_weight[0],
+                FIELD_CONSTANT / (4.0 * pi),
+            )
+            if self.include_self_interaction:
+                features = features + self.self_interaction(feats)
+            return features
         # For l=0 density with l=1 projection, pad to 4 components
         if self.density_max_l == 0 and self.projection_max_l == 1 and feats.shape[-1] == 1:
             padded = torch.zeros(

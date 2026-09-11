@@ -36,6 +36,7 @@ from scipy.constants import pi
 try:
     import warp as wp
 
+    wp.init()
     _HAS_WARP = True
 except Exception:  # pragma: no cover - warp optional
     wp = None

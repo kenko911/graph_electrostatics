@@ -42,9 +42,12 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 
 from .pme import PMEElectrostaticEnergy, PMEElectrostaticFeatures
+from .pme_optimized import _pme_energy_impl, _pme_features_impl
 
 try:
     from nvalchemiops.torch.interactions.electrostatics import (
@@ -294,6 +297,150 @@ class PMEElectrostaticEnergyWarp(PMEElectrostaticEnergy):
                 energies = energies + corr
 
         return energies
+
+
+def _compute_pme_single_fused_warp(
+    coords: torch.Tensor,
+    box: torch.Tensor,
+    q: torch.Tensor,
+    p: torch.Tensor | None,
+    alpha: float,
+    K: int,
+    rank: int,
+    want_field: bool = False,
+    Q: torch.Tensor | None = None,
+    want_hessian: bool = False,
+    reciprocal_cache: dict | None = None,
+    geometry_cache: dict | None = None,
+    *,
+    spline_order: int = 6,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Fused Warp spread/gather with the reference PME Green function.
+
+    Keeping graph_longrange's reciprocal factors makes this a backend change,
+    rather than a change to the mesh approximation. Fractional moments let the
+    unified spread-transpose gather return potential, field, and Hessian in one
+    differentiable operation while retaining live-cell NPT gradients.
+    """
+    del geometry_cache  # The Warp primitive builds and fuses its own stencil.
+    from .pme import _precompute_pme_reciprocal
+
+    if reciprocal_cache is None:
+        reciprocal_cache = _precompute_pme_reciprocal(box, alpha, K)
+
+    n_atoms = coords.shape[0]
+    cell = box.unsqueeze(0) if box.dim() == 2 else box
+    cell_inv_batched = torch.linalg.inv_ex(cell)[0]
+    cell_inv_t = cell_inv_batched.transpose(-1, -2).contiguous()
+    atom_batch = torch.zeros(n_atoms, dtype=torch.int32, device=coords.device)
+    dipoles = p if rank >= 1 and p is not None else torch.zeros_like(coords)
+    quadrupoles = (
+        Q
+        if rank >= 2 and Q is not None
+        else torch.zeros((n_atoms, 3, 3), dtype=coords.dtype, device=coords.device)
+    )
+    p_frac, d_frac, q_frac = torch.ops.nvalchemiops.multipole_pme_fractionalize(
+        coords,
+        cell_inv_t,
+        dipoles,
+        quadrupoles,
+        atom_batch,
+    )
+    identity_cell = torch.eye(3, dtype=coords.dtype, device=coords.device).unsqueeze(0)
+    rho_grid = torch.ops.nvalchemiops.multipole_pme_spread_unified(
+        p_frac,
+        q,
+        d_frac,
+        q_frac,
+        identity_cell,
+        K,
+        K,
+        K,
+        spline_order,
+        rank,
+    )
+
+    # Use rFFT for the real mesh but retain the exact reference Green factors.
+    # This deliberately avoids nvalchemiops' sinc approximation, which defines
+    # a measurably different PME discretization at order 6.
+    rho_k = torch.fft.rfftn(rho_grid, norm="backward").contiguous()
+    nz_rfft = K // 2 + 1
+    green = reciprocal_cache["coulomb"].reshape(K, K, K)[:, :, :nz_rfft]
+    theta = reciprocal_cache["theta_safe"].reshape(K, K, K)[:, :, :nz_rfft]
+    phi_k = rho_k * green / theta.pow(2)
+    phi_grid = torch.fft.irfftn(phi_k, s=(K, K, K), norm="forward").to(coords.dtype)
+
+    phi, gathered_d, gathered_Q = torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t(
+        phi_grid,
+        p_frac,
+        identity_cell,
+        K,
+        K,
+        K,
+        spline_order,
+        rank,
+    )
+    want_field_actual = want_field or rank >= 1
+    want_hessian_actual = want_hessian or rank >= 2
+    cell_inv = cell_inv_batched[0]
+    field = (-gathered_d @ cell_inv) if want_field_actual else None
+    hessian = (
+        torch.einsum("ac,ncd,db->nab", cell_inv.T, 2.0 * gathered_Q, cell_inv)
+        if want_hessian_actual
+        else None
+    )
+    return phi, field, hessian
+
+
+class PMEElectrostaticFeaturesWarpPME(PMEElectrostaticFeatures):
+    """Experimental fused mesh-PME feature backend.
+
+    The Torch PME remains the default. This backend is selected explicitly by
+    TensorNetPolar ``use_warp_pme=True`` and keeps the same mesh size, order-6
+    spline, Green function, feature layout, and molecular fallback.
+    """
+
+    def __init__(self, *args, spline_order: int = 6, **kwargs):
+        _require_toolkit()
+        super().__init__(*args, **kwargs)
+        self.spline_order = int(spline_order)
+
+    def _pme_features(self, source_feats, node_positions, batch, box):
+        return _pme_features_impl(
+            self,
+            source_feats,
+            node_positions,
+            batch,
+            box,
+            partial(_compute_pme_single_fused_warp, spline_order=self.spline_order),
+        )
+
+
+class PMEElectrostaticEnergyWarpPME(PMEElectrostaticEnergy):
+    """Experimental exact-Green fused mesh-PME energy backend.
+
+    Unlike :class:`PMEElectrostaticEnergyWarp`, this class keeps the reference
+    graph_longrange PME discretization and only replaces spread/gather with the
+    differentiable unified Warp operations. This is the energy counterpart of
+    :class:`PMEElectrostaticFeaturesWarpPME`.
+    """
+
+    def __init__(self, *args, spline_order: int = 6, **kwargs):
+        _require_toolkit()
+        super().__init__(*args, **kwargs)
+        self.spline_order = int(spline_order)
+
+    def _pme_energy(self, source_feats, node_positions, batch, box, volume, pbc):
+        return _pme_energy_impl(
+            self,
+            source_feats,
+            node_positions,
+            batch,
+            box,
+            volume,
+            pbc,
+            partial(_compute_pme_single_fused_warp, spline_order=self.spline_order),
+        )
 
 
 class PMEElectrostaticFeaturesWarp(PMEElectrostaticFeatures):

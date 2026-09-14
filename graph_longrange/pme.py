@@ -32,15 +32,14 @@ from .gto_utils import GTOSelfInteractionBlock, get_Cl_sigma
 from .realspace_electrostatics import (
     RealSpaceAnalyticalEnergy,
     RealSpaceAnalyticalElectrostaticFeatures,
-    batch_complete_graph_excluding_self_duplicates_vector,
     _l2_source_to_cartesian,
 )
+from .slabs import MonopoleDipoleCorrectionBlock, slab_dipole_correction_energy
+from .utils import FIELD_CONSTANT
 
 # SH(l=2)->Cartesian convention factor that matches the GTO k-space quadrupole
 # normalization (energy is quadratic in Q, so 2/3 here == (2/3)^2 in the energy).
 _PME_QUAD_SH_TO_CART = 2.0 / 3.0
-from .slabs import slab_dipole_correction_energy, MonopoleDipoleCorrectionBlock
-from .utils import FIELD_CONSTANT
 
 # Coulomb scaling: PME energies are in Gaussian-unit (4π) convention;
 # multiply by this to get code-unit energies.
@@ -145,11 +144,20 @@ def _grid_hessian_weights(M: torch.Tensor, dM: torch.Tensor, ddM: torch.Tensor) 
     ], dim=-2)
 
 
+_STENCIL_CACHE: dict = {}
+
+
 def _make_stencil(order: int, device, dtype) -> torch.Tensor:
+    key = (int(order), str(device), dtype)
+    cached = _STENCIL_CACHE.get(key)
+    if cached is not None:
+        return cached
     half = order // 2
     r = torch.arange(-half, half, device=device, dtype=dtype)
     shifts = torch.stack(torch.meshgrid(r, r, r, indexing="ij"), dim=-1)
-    return shifts.reshape(1, order**3, 3)
+    result = shifts.reshape(1, order**3, 3)
+    _STENCIL_CACHE[key] = result
+    return result
 
 
 def _get_recip_vectors(N: torch.Tensor, box: torch.Tensor) -> torch.Tensor:
@@ -165,11 +173,13 @@ def _get_u_reference(coords: torch.Tensor, Nj_Aji_star: torch.Tensor, order: int
 
 
 def _scatter_to_mesh(W: torch.Tensor, m_u0: torch.Tensor,
-                      N: torch.Tensor, shifts: torch.Tensor) -> torch.Tensor:
+                      N: torch.Tensor, shifts: torch.Tensor,
+                      grid_shape: Optional[tuple[int, int, int]] = None) -> torch.Tensor:
     N = N.int()
     idx = (m_u0[:, None, :] + shifts) % N[None, None, :]
     idx = idx.to(torch.int64)
-    mesh = torch.zeros(N.tolist(), dtype=W.dtype, device=W.device)
+    mesh = torch.zeros(grid_shape if grid_shape is not None else N.tolist(),
+                       dtype=W.dtype, device=W.device)
     mesh.index_put_(
         (idx[:, :, 0].flatten(), idx[:, :, 1].flatten(), idx[:, :, 2].flatten()),
         W.flatten(), accumulate=True,
@@ -181,7 +191,8 @@ def _spread_charges(positions: torch.Tensor, box: torch.Tensor,
                     q: torch.Tensor, p: Optional[torch.Tensor],
                     N: torch.Tensor, order: int = 6,
                     Q: Optional[torch.Tensor] = None,
-                    Nj: Optional[torch.Tensor] = None) -> torch.Tensor:
+                    Nj: Optional[torch.Tensor] = None,
+                    grid_shape: Optional[tuple[int, int, int]] = None) -> torch.Tensor:
     """Spread monopoles (+ optional dipoles p, + optional Cartesian quadrupoles Q) via B-splines.
 
     Density Taylor expansion: ρ = q·δ − p·∇δ + ½ Q:∇∇δ, so the mesh weights are
@@ -213,10 +224,11 @@ def _spread_charges(positions: torch.Tensor, box: torch.Tensor,
         Q_u = torch.einsum("ab,nbc,dc->nad", Nj, Q, Nj)   # quad in grid basis: Nj Q Njᵀ
         W = W + 0.5 * (Q_u[:, None, :, :] * ggW).sum(dim=(-1, -2))
 
-    return _scatter_to_mesh(W, m_u0, N, shifts[0])
+    return _scatter_to_mesh(W, m_u0, N, shifts[0], grid_shape)
 
 
 _THETA_CACHE: dict = {}
+_PME_GRID_CACHE: dict = {}
 
 
 def _theta_k(N: torch.Tensor, order: int, device, dtype) -> torch.Tensor:
@@ -247,17 +259,37 @@ def _theta_k(N: torch.Tensor, order: int, device, dtype) -> torch.Tensor:
     return theta
 
 
+def _fixed_pme_grid(K: int, device, dtype) -> dict:
+    """Cache cell-independent FFT indices and spline corrections for NPT."""
+    key = (int(K), str(device), dtype)
+    cached = _PME_GRID_CACHE.get(key)
+    if cached is not None:
+        return cached
+    N = torch.full((3,), K, device=device, dtype=dtype)
+    freq = torch.fft.fftfreq(K, d=1.0 / K, device=device, dtype=dtype)
+    kpts_int = torch.stack(torch.meshgrid(freq, freq, freq, indexing="ij"), dim=-1).reshape(-1, 3)
+    result = {
+        "N": N,
+        "grid_shape": (K, K, K),
+        "kpts_int": kpts_int,
+        "theta_safe": _theta_k(N, order=6, device=device, dtype=dtype).abs().clamp(min=1e-10),
+    }
+    _PME_GRID_CACHE[key] = result
+    return result
+
+
 def _interpolate_potential(phi_grid: torch.Tensor, positions: torch.Tensor,
                             box: torch.Tensor, N: torch.Tensor,
                             want_field: bool, order: int = 6, want_hessian: bool = False,
-                            Nj: Optional[torch.Tensor] = None):
+                            Nj: Optional[torch.Tensor] = None,
+                            grid_shape: Optional[tuple[int, int, int]] = None):
     """Gather potential (and optionally field) at atom positions via B-spline interpolation."""
     if Nj is None:
         Nj = _get_recip_vectors(N, box)
     m_u0, u0 = _get_u_reference(positions, Nj, order)
     shifts = _make_stencil(order, positions.device, positions.dtype)
 
-    Nx, Ny, Nz = N.int().tolist()
+    Nx, Ny, Nz = grid_shape if grid_shape is not None else N.int().tolist()
     idx = (m_u0[:, None, :] + shifts[0]) % N.int()[None, None, :]
     flat_idx = (idx[:, :, 0] * Ny * Nz + idx[:, :, 1] * Nz + idx[:, :, 2]).long()
     phi_loc = phi_grid.reshape(-1)[flat_idx]          # [Na, S]
@@ -289,9 +321,9 @@ def _interpolate_potential(phi_grid: torch.Tensor, positions: torch.Tensor,
 def _precompute_pme_reciprocal(box: torch.Tensor, alpha: float, K: int) -> dict:
     """Build the position/source-independent PME data for one cell."""
     device, dtype = box.device, box.dtype
-    N = torch.full((3,), K, device=device, dtype=dtype)
-    freq = torch.fft.fftfreq(K, d=1.0 / K, device=device, dtype=dtype)
-    kpts_int = torch.stack(torch.meshgrid(freq, freq, freq, indexing="ij"), dim=-1).reshape(-1, 3)
+    fixed_grid = _fixed_pme_grid(K, device, dtype)
+    N = fixed_grid["N"]
+    kpts_int = fixed_grid["kpts_int"]
     box_inv = torch.linalg.inv(box).T
     kpts = 2 * math.pi * torch.matmul(kpts_int, box_inv)
     ksq = (kpts**2).sum(-1)
@@ -301,8 +333,9 @@ def _precompute_pme_reciprocal(box: torch.Tensor, alpha: float, K: int) -> dict:
     coulomb[mask] = (4.0 * math.pi / volume) * torch.exp(-ksq[mask] / (4.0 * alpha**2)) / ksq[mask]
     return {
         "N": N,
+        "grid_shape": fixed_grid["grid_shape"],
         "Nj": _get_recip_vectors(N, box),
-        "theta_safe": _theta_k(N, order=6, device=device, dtype=dtype).abs().clamp(min=1e-10),
+        "theta_safe": fixed_grid["theta_safe"],
         "mask": mask,
         "coulomb": coulomb,
     }
@@ -367,9 +400,11 @@ def compute_pme_single(
         reciprocal_cache = _precompute_pme_reciprocal(box, alpha, K)
     N = reciprocal_cache["N"]
     Nj = reciprocal_cache["Nj"]
+    grid_shape = reciprocal_cache.get("grid_shape", (K, K, K))
 
     mesh = _spread_charges(coords, box, q, p if rank >= 1 else None, N,
-                           Q=Q if rank >= 2 else None, Nj=Nj)
+                           Q=Q if rank >= 2 else None, Nj=Nj,
+                           grid_shape=grid_shape)
 
     # Structure factor & Green's function
     S_k = torch.fft.fftn(mesh).reshape(-1)               # [N³]
@@ -382,7 +417,8 @@ def compute_pme_single(
     want_hessian_actual = want_hessian or (rank >= 2)
     phi_atoms, E_atoms, H_atoms = _interpolate_potential(
         Phi_real, coords, box, N,
-        want_field=want_field_actual, want_hessian=want_hessian_actual, Nj=Nj)
+        want_field=want_field_actual, want_hessian=want_hessian_actual, Nj=Nj,
+        grid_shape=grid_shape)
     return phi_atoms, E_atoms, H_atoms
 
 

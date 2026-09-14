@@ -22,6 +22,7 @@ import math
 import pytest
 import torch
 
+import graph_longrange.pme as pme_module
 from graph_longrange.energy import GTOElectrostaticEnergy
 from graph_longrange.features import GTOElectrostaticFeatures
 from graph_longrange.kspace import compute_k_vectors_flat
@@ -37,6 +38,51 @@ SIGMA_PROJ = [1.0, 1.5]
 
 PME_RTOL = 5e-3   # 0.5 %
 PME_ATOL = 0.1    # absolute, for small features
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_npt_grid_cache_preserves_l2_values_forces_and_cell_gradients(dtype):
+    """Fixed-grid reuse must not alter l=2 PME arithmetic for a live NPT cell."""
+    previous_default = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        torch.manual_seed(321)
+        n_atoms, mesh = 4, 8
+        base_coords = torch.rand(n_atoms, 3, dtype=dtype) * 4.0
+        base_box = torch.tensor(
+            [[6.1, 0.2, 0.0], [0.1, 5.8, 0.3], [0.0, 0.2, 6.3]], dtype=dtype
+        )
+        base_q = torch.randn(n_atoms, dtype=dtype)
+        base_p = torch.randn(n_atoms, 3, dtype=dtype)
+        base_Q = torch.randn(n_atoms, 3, 3, dtype=dtype)
+        weights = (
+            torch.randn(n_atoms, dtype=dtype),
+            torch.randn(n_atoms, 3, dtype=dtype),
+            torch.randn(n_atoms, 3, 3, dtype=dtype),
+        )
+
+        def evaluate(use_python_grid_shape):
+            variables = tuple(
+                value.clone().requires_grad_()
+                for value in (base_coords, base_box, base_q, base_p, base_Q)
+            )
+            coords, box, q, p, Q = variables
+            reciprocal = pme_module._precompute_pme_reciprocal(box, 1.0 / 2.4, mesh)
+            if not use_python_grid_shape:
+                reciprocal = {key: value for key, value in reciprocal.items() if key != "grid_shape"}
+            output = pme_module.compute_pme_single(
+                coords, box, q, p, 1.0 / 2.4, mesh, rank=2, Q=Q,
+                want_field=True, want_hessian=True, reciprocal_cache=reciprocal,
+            )
+            gradients = torch.autograd.grad(output, variables, weights)
+            return output, gradients
+
+        cached_output, cached_gradients = evaluate(True)
+        legacy_output, legacy_gradients = evaluate(False)
+        for cached, legacy in zip(cached_output + cached_gradients, legacy_output + legacy_gradients):
+            torch.testing.assert_close(cached, legacy, atol=0, rtol=0)
+    finally:
+        torch.set_default_dtype(previous_default)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

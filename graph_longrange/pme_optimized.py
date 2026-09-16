@@ -24,11 +24,29 @@ from .pme import (
     _fixed_pme_grid,
     _get_recip_vectors,
     _get_u_reference,
-    _grid_hessian_weights,
     _l2_source_to_cartesian,
     _make_stencil,
 )
 from .slabs import slab_dipole_correction_energy
+
+
+def _symmetric_hessian_weights(
+    basis: torch.Tensor,
+    basis_gradient: torch.Tensor,
+    basis_hessian: torch.Tensor,
+) -> torch.Tensor:
+    """Return the six independent components of the spline Hessian."""
+    return torch.stack(
+        [
+            basis_hessian[:, :, 0] * basis[:, :, 1] * basis[:, :, 2],
+            basis_gradient[:, :, 0] * basis_gradient[:, :, 1] * basis[:, :, 2],
+            basis_gradient[:, :, 0] * basis[:, :, 1] * basis_gradient[:, :, 2],
+            basis[:, :, 0] * basis_hessian[:, :, 1] * basis[:, :, 2],
+            basis[:, :, 0] * basis_gradient[:, :, 1] * basis_gradient[:, :, 2],
+            basis[:, :, 0] * basis[:, :, 1] * basis_hessian[:, :, 2],
+        ],
+        dim=2,
+    )
 
 
 def build_pme_geometry_optimized(
@@ -68,7 +86,9 @@ def build_pme_geometry_optimized(
         )
     if rank >= 2:
         basis_hessian = _bspline_double_prime(u)
-        hessian_weights = _grid_hessian_weights(basis, basis_gradient, basis_hessian)
+        hessian_weights = _symmetric_hessian_weights(
+            basis, basis_gradient, basis_hessian
+        )
     return {
         "N": N,
         "Nj": Nj,
@@ -94,9 +114,20 @@ def _spread_with_geometry(
     if Q is not None:
         Nj = geometry["Nj"]
         Q_grid = torch.einsum("ab,nbc,dc->nad", Nj, Q, Nj)
+        Q_symmetric = torch.stack(
+            [
+                Q_grid[:, 0, 0],
+                Q_grid[:, 0, 1] + Q_grid[:, 1, 0],
+                Q_grid[:, 0, 2] + Q_grid[:, 2, 0],
+                Q_grid[:, 1, 1],
+                Q_grid[:, 1, 2] + Q_grid[:, 2, 1],
+                Q_grid[:, 2, 2],
+            ],
+            dim=1,
+        )
         weights = weights + 0.5 * (
-            Q_grid[:, None, :, :] * geometry["hessian_weights"]
-        ).sum(dim=(-1, -2))
+            Q_symmetric[:, None, :] * geometry["hessian_weights"]
+        ).sum(dim=-1)
     mesh = torch.zeros(
         math.prod(geometry["grid_shape"]), dtype=weights.dtype, device=weights.device
     )
@@ -118,9 +149,18 @@ def _gather_with_geometry(
         field_grid = (local.unsqueeze(-1) * geometry["gradient_weights"]).sum(dim=1)
         field = torch.matmul(field_grid, geometry["Nj"].T)
     if want_hessian:
-        hessian_grid = (
-            local[:, :, None, None] * geometry["hessian_weights"]
+        hessian_symmetric = (
+            local.unsqueeze(-1) * geometry["hessian_weights"]
         ).sum(dim=1)
+        xx, xy, xz, yy, yz, zz = hessian_symmetric.unbind(dim=-1)
+        hessian_grid = torch.stack(
+            [
+                torch.stack([xx, xy, xz], dim=-1),
+                torch.stack([xy, yy, yz], dim=-1),
+                torch.stack([xz, yz, zz], dim=-1),
+            ],
+            dim=-2,
+        )
         Nj = geometry["Nj"]
         hessian = torch.einsum("ac,ncd,bd->nab", Nj, hessian_grid, Nj)
     return phi, field, hessian

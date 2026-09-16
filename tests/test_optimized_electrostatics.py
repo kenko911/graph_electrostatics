@@ -36,7 +36,8 @@ def _stable_default_dtype():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_optimized_pme_l2_matches_in_forward_and_backward(dtype):
+@pytest.mark.parametrize("mesh_size", [8, 10], ids=["power-of-two", "five-smooth"])
+def test_optimized_pme_l2_matches_in_forward_and_backward(dtype, mesh_size):
     torch.manual_seed(71)
     variables = (
         torch.rand(7, 3, dtype=dtype).requires_grad_(),
@@ -46,8 +47,20 @@ def test_optimized_pme_l2_matches_in_forward_and_backward(dtype):
         torch.randn(7, 3, 3, dtype=dtype).requires_grad_(),
     )
     positions, box, charges, dipoles, quadrupoles = variables
-    reciprocal = _precompute_pme_reciprocal(box, 1.0 / 2.4, 8)
-    args = (positions, box, charges, dipoles, 1.0 / 2.4, 8, 2, True, quadrupoles, True, reciprocal)
+    reciprocal = _precompute_pme_reciprocal(box, 1.0 / 2.4, mesh_size)
+    args = (
+        positions,
+        box,
+        charges,
+        dipoles,
+        1.0 / 2.4,
+        mesh_size,
+        2,
+        True,
+        quadrupoles,
+        True,
+        reciprocal,
+    )
     expected = compute_pme_single(*args)
     actual = compute_pme_single_optimized(*args)
     weights = tuple(torch.randn_like(value) for value in expected)
@@ -101,6 +114,7 @@ def test_optimized_pme_modules_l2_match_forward_and_backward(dtype):
         rank=2,
         Nj=reciprocal["Nj"],
     )
+    assert geometry["hessian_weights"].shape[-1] == 6
     geometry["reciprocal"] = {optimized_features.alphas[0]: reciprocal}
     shared_geometry = [geometry]
     actual = (

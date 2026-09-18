@@ -383,9 +383,13 @@ def _compute_pme_single_fused_warp(
     want_field_actual = want_field or rank >= 1
     want_hessian_actual = want_hessian or rank >= 2
     cell_inv = cell_inv_batched[0]
-    field = (-gathered_d @ cell_inv) if want_field_actual else None
+    # Fractionalization uses s = r @ A^-1 (cell_inv_t passed to multipole_pme_fractionalize),
+    # so ds_i/dr_j = A^-1[j,i] and the back-transform of a fractional-frame gradient is A^-T,
+    # with the Hessian going as A^-1 H A^-T.  Both were transposed.  Identical for an orthogonal
+    # cell (A diagonal), wrong on a triclinic one -- same class of bug as the torch gather.
+    field = (-gathered_d @ cell_inv.T) if want_field_actual else None
     hessian = (
-        torch.einsum("ac,ncd,db->nab", cell_inv.T, 2.0 * gathered_Q, cell_inv)
+        torch.einsum("ac,ncd,bd->nab", cell_inv, 2.0 * gathered_Q, cell_inv)
         if want_hessian_actual
         else None
     )

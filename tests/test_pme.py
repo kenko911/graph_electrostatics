@@ -512,3 +512,93 @@ class TestRegressions:
         scale = F_ref.abs().max().clamp(min=1e-8)
         assert (abs_err / scale).item() < 0.005, \
             f"Feature regression: rel_err={abs_err/scale:.4f}"
+
+
+# ---------------------------------------------------------------------------
+# Non-orthogonal (triclinic) cell regression coverage.
+#
+# Every other PME test in this file uses a cubic/orthogonal box.  The grid->Cartesian
+# back-transform matrices (Nj in the torch path, cell_inv in the Warp path) are DIAGONAL for an
+# orthogonal cell, so a transpose error in them is mathematically invisible there.  That is
+# exactly how a real bug survived: the l>=1 gather applied Nj instead of Nj^T, producing ~0.3-0.5%
+# errors in dipole/quadrupole forces, stress and BEC on any triclinic cell, while every test
+# passed.  These tests pin the behaviour against the exact direct-k Ewald sum on a deliberately
+# triclinic cell.  Do not "simplify" them to a cubic box.
+# ---------------------------------------------------------------------------
+
+TRICLINIC_BOX = [[11.75, 0.0, 0.0], [0.057, 11.79, 0.0], [-0.083, -0.061, 11.77]]
+
+
+def _triclinic_case(dtype, density_max_l, n_atoms=12, seed=17):
+    torch.manual_seed(seed)
+    cell = torch.tensor(TRICLINIC_BOX, dtype=dtype)
+    frac = torch.rand(n_atoms, 3, dtype=dtype)
+    positions = (frac @ cell).requires_grad_()
+    cell = cell.requires_grad_()
+    source = (torch.randn(n_atoms, (density_max_l + 1) ** 2, dtype=dtype) * 0.1).requires_grad_()
+    batch = torch.zeros(n_atoms, dtype=torch.long)
+    pbc = torch.ones(1, 3, dtype=torch.bool)
+    volume = torch.linalg.det(cell.unsqueeze(0))
+    return cell, positions, source, batch, pbc, volume
+
+
+@pytest.mark.parametrize("density_max_l", [0, 1, 2])
+def test_pme_matches_ewald_on_triclinic_cell(density_max_l):
+    """PME must match the exact direct-k Ewald sum on a NON-ORTHOGONAL cell, for every
+    multipole order -- not just l=0.  Catches transposed grid->Cartesian back-transforms,
+    which a cubic cell cannot detect."""
+    from graph_longrange.energy import GTOElectrostaticEnergy
+    from graph_longrange.kspace import compute_k_vectors_flat
+
+    dtype, sigma, kcut, mesh = torch.float64, 1.5, 3.0, 48
+    cell, positions, source, batch, pbc, volume = _triclinic_case(dtype, density_max_l)
+
+    ewald = GTOElectrostaticEnergy(density_max_l, sigma, kcut,
+                                   include_self_interaction=False).to(dtype)
+    pme = pme_module.PMEElectrostaticEnergy(density_max_l, sigma, mesh,
+                                            include_self_interaction=False).to(dtype)
+
+    rcell = 2.0 * torch.pi * torch.linalg.inv(cell).transpose(-1, -2)
+    kv, knorm2, kbatch, k0 = compute_k_vectors_flat(kcut, cell.unsqueeze(0), rcell.unsqueeze(0))
+    e_ewald = ewald(kv, knorm2, kbatch, k0, source, positions, batch, volume, pbc,
+                    force_pbc_evaluator=True)
+    e_pme = pme(source, positions, batch, cell.unsqueeze(0), volume, pbc)
+
+    g_ewald = torch.autograd.grad(e_ewald.sum(), positions, retain_graph=True)[0]
+    g_pme = torch.autograd.grad(e_pme.sum(), positions, retain_graph=True)[0]
+
+    # Pre-fix this was 5e-4 (l=1) / 2.3e-3 (l=2) on energy and ~4e-3 on forces, and was
+    # mesh-INDEPENDENT (identical from mesh=32 to mesh=256), so a tolerance here of 1e-5 is
+    # far outside the discretization floor and specifically detects the transform bug.
+    e_rel = (e_pme - e_ewald).abs().max() / e_ewald.abs().max().clamp_min(1e-30)
+    g_rel = (g_pme - g_ewald).abs().max() / g_ewald.abs().max().clamp_min(1e-30)
+    assert e_rel < 1e-5, f"triclinic PME energy deviates from Ewald: rel={e_rel:.3e}"
+    assert g_rel < 1e-4, f"triclinic PME force deviates from Ewald: rel={g_rel:.3e}"
+
+
+def test_pme_triclinic_agreement_is_mesh_convergent():
+    """A transform bug is mesh-INDEPENDENT while discretization error shrinks with the mesh.
+    Refining the mesh must measurably improve l=2 agreement with Ewald; if it does not, a
+    coordinate-transform error is present."""
+    from graph_longrange.energy import GTOElectrostaticEnergy
+    from graph_longrange.kspace import compute_k_vectors_flat
+
+    dtype, sigma, kcut = torch.float64, 1.5, 3.0
+    cell, positions, source, batch, pbc, volume = _triclinic_case(dtype, 2)
+    ewald = GTOElectrostaticEnergy(2, sigma, kcut, include_self_interaction=False).to(dtype)
+    rcell = 2.0 * torch.pi * torch.linalg.inv(cell).transpose(-1, -2)
+    kv, knorm2, kbatch, k0 = compute_k_vectors_flat(kcut, cell.unsqueeze(0), rcell.unsqueeze(0))
+    e_ewald = ewald(kv, knorm2, kbatch, k0, source, positions, batch, volume, pbc,
+                    force_pbc_evaluator=True)
+
+    errs = []
+    for mesh in (12, 48):
+        pme = pme_module.PMEElectrostaticEnergy(2, sigma, mesh,
+                                                include_self_interaction=False).to(dtype)
+        e_pme = pme(source, positions, batch, cell.unsqueeze(0), volume, pbc)
+        errs.append(float((e_pme - e_ewald).abs().max() / e_ewald.abs().max().clamp_min(1e-30)))
+
+    assert errs[1] < errs[0] / 10.0, (
+        f"refining the mesh did not improve triclinic agreement ({errs[0]:.3e} -> {errs[1]:.3e}); "
+        "a mesh-independent residual indicates a grid->Cartesian transform error"
+    )

@@ -309,11 +309,14 @@ def _interpolate_potential(phi_grid: torch.Tensor, positions: torch.Tensor,
             B[:, :, 0] * B[:, :, 1] * dB[:, :, 2],
         ], dim=2)
         grad_phi_u = (phi_loc.unsqueeze(-1) * grad_W).sum(dim=1)  # [Na, 3]
-        E_atoms = torch.matmul(grad_phi_u, Nj.T)      # [Na, 3]
+        # u = Nj @ r (see _get_u_reference), so du_i/dr_j = Nj[i,j] and the back-transform
+        # of a grid-frame gradient is Nj^T, not Nj.  Identical for an orthogonal cell (Nj
+        # diagonal), wrong by ~0.3-0.5% on the l>=1 channels for a triclinic one.
+        E_atoms = torch.matmul(grad_phi_u, Nj)        # [Na, 3]
     if want_hessian:
         ddB = _bspline_double_prime(u)
         Hgrid = (phi_loc[:, :, None, None] * _grid_hessian_weights(B, dB, ddB)).sum(dim=1)  # [Na,3,3] grid-frame
-        H_atoms = torch.einsum("ac,ncd,bd->nab", Nj, Hgrid, Nj)   # [Na,3,3] physical ∇∇φ
+        H_atoms = torch.einsum("ca,ncd,db->nab", Nj, Hgrid, Nj)   # [Na,3,3] physical ∇∇φ (Nj^T H Nj)
 
     return phi_atoms, E_atoms, H_atoms
 

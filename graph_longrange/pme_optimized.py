@@ -147,7 +147,8 @@ def _gather_with_geometry(
     hessian = None
     if want_field:
         field_grid = (local.unsqueeze(-1) * geometry["gradient_weights"]).sum(dim=1)
-        field = torch.matmul(field_grid, geometry["Nj"].T)
+        # Nj^T, not Nj: u = Nj @ r so du_i/dr_j = Nj[i,j] (see pme._get_u_reference).
+        field = torch.matmul(field_grid, geometry["Nj"])
     if want_hessian:
         hessian_symmetric = (
             local.unsqueeze(-1) * geometry["hessian_weights"]
@@ -162,7 +163,7 @@ def _gather_with_geometry(
             dim=-2,
         )
         Nj = geometry["Nj"]
-        hessian = torch.einsum("ac,ncd,bd->nab", Nj, hessian_grid, Nj)
+        hessian = torch.einsum("ca,ncd,db->nab", Nj, hessian_grid, Nj)
     return phi, field, hessian
 
 

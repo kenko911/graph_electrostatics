@@ -20,8 +20,6 @@ from .pme import (
     _bspline,
     _bspline_double_prime,
     _bspline_prime,
-    _cached_pme_reciprocal,
-    _fixed_pme_grid,
     _get_recip_vectors,
     _get_u_reference,
     _l2_source_to_cartesian,
@@ -30,23 +28,123 @@ from .pme import (
 from .slabs import slab_dipole_correction_energy
 
 
+_RFFT_GRID_CACHE: dict = {}
+
+
+def _fixed_pme_grid_rfft(K: int, device, dtype) -> dict:
+    """Prepare only the reference's retained FFT frequencies and spline factors.
+
+    Keep fftfreq's NEGATIVE Nyquist frequency on the last axis: substituting
+    rfftfreq would change cross terms for triclinic cells.
+    """
+    key = (K, str(device), dtype)
+    if key not in _RFFT_GRID_CACHE:
+        freq = torch.fft.fftfreq(K, d=1.0 / K, device=device, dtype=dtype)
+        kpts = torch.stack(torch.meshgrid(freq, freq, freq[:K // 2 + 1], indexing="ij"), -1)
+        m = torch.arange(-3, 3, device=device, dtype=dtype).reshape(-1, 1, 1)
+        indices = torch.arange(K, device=device, dtype=dtype)
+        integer_grid = torch.stack(torch.meshgrid(
+            indices, indices, indices[:K // 2 + 1], indexing="ij"), -1).reshape(-1, 3)
+        N = torch.full((3,), K, device=device, dtype=dtype)
+        # Match reference operation order, including tensor division and prod.
+        theta = (_bspline(m + 3) * torch.cos(
+            2 * math.pi * m * integer_grid[None, :, :] / N
+        )).sum(0).prod(1).abs().clamp(min=1e-10).reshape(K, K, K // 2 + 1)
+        _RFFT_GRID_CACHE[key] = {
+            "N": N,
+            "grid_shape": (K, K, K),
+            "kpts_int": kpts.reshape(-1, 3),
+            "rfft_theta_squared": theta.square().contiguous(),
+        }
+    return _RFFT_GRID_CACHE[key]
+
+
+def _precompute_pme_reciprocal_rfft(box: torch.Tensor, alpha: float, K: int) -> dict:
+    fixed = _fixed_pme_grid_rfft(K, box.device, box.dtype)
+    inverse = torch.linalg.inv(box)
+    kpts = 2 * math.pi * torch.matmul(fixed["kpts_int"], inverse.T)
+    ksq = kpts.square().sum(-1)
+    mask = ksq > 1e-10
+    denominator = torch.where(mask, ksq, torch.ones_like(ksq))
+    green = ((4 * math.pi / torch.linalg.det(box).abs())
+             * torch.exp(-ksq / (4 * alpha**2)) / denominator)
+    green = torch.where(mask, green, torch.zeros_like(green))
+    return {
+        "N": fixed["N"], "grid_shape": fixed["grid_shape"],
+        "Nj": (fixed["N"][None, :] * inverse).T,
+        "rfft_coulomb": green.reshape(K, K, K // 2 + 1),
+        "rfft_theta_squared": fixed["rfft_theta_squared"],
+    }
+
+
+def _cached_pme_reciprocal_optimized(module, box, alphas, K):
+    """Fixed-cell half-spectrum cache; live cells always retain fresh autograd graphs."""
+    if box.requires_grad:
+        return [[_precompute_pme_reciprocal_rfft(cell, a, K) for cell in box] for a in alphas]
+    signature = (tuple(box.shape), box.dtype, box.device, K, tuple(alphas))
+    try:
+        version = box._version
+    except RuntimeError:  # inference_mode tensors have no version counter
+        version = None
+    cached = getattr(module, "_pme_rfft_cache", None)
+    if cached is not None and getattr(module, "_pme_rfft_signature", None) == signature:
+        same_storage = (getattr(module, "_pme_rfft_ptr", None) == box.data_ptr()
+                        and version is not None
+                        and getattr(module, "_pme_rfft_version", None) == version)
+        if same_storage or torch.equal(module._pme_rfft_box, box):
+            return cached
+    result = [[_precompute_pme_reciprocal_rfft(cell, a, K) for cell in box] for a in alphas]
+    module._pme_rfft_cache = result
+    module._pme_rfft_signature = signature
+    module._pme_rfft_ptr = box.data_ptr()
+    module._pme_rfft_version = version
+    module._pme_rfft_box = box.detach().clone()
+    return result
+
+
+def _axis_product(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """Tensor product without materializing three expanded axis tensors."""
+    return (x[:, :, None, None] * y[:, None, :, None] * z[:, None, None, :]).flatten(1)
+
+
 def _symmetric_hessian_weights(
     basis: torch.Tensor,
     basis_gradient: torch.Tensor,
     basis_hessian: torch.Tensor,
 ) -> torch.Tensor:
-    """Return the six independent components of the spline Hessian."""
+    """Return six stencil Hessian components from compact [atoms, 6, xyz] bases."""
+    x, y, z = basis.unbind(-1)
+    dx, dy, dz = basis_gradient.unbind(-1)
+    ddx, ddy, ddz = basis_hessian.unbind(-1)
     return torch.stack(
         [
-            basis_hessian[:, :, 0] * basis[:, :, 1] * basis[:, :, 2],
-            basis_gradient[:, :, 0] * basis_gradient[:, :, 1] * basis[:, :, 2],
-            basis_gradient[:, :, 0] * basis[:, :, 1] * basis_gradient[:, :, 2],
-            basis[:, :, 0] * basis_hessian[:, :, 1] * basis[:, :, 2],
-            basis[:, :, 0] * basis_gradient[:, :, 1] * basis_gradient[:, :, 2],
-            basis[:, :, 0] * basis[:, :, 1] * basis_hessian[:, :, 2],
+            _axis_product(ddx, y, z),
+            _axis_product(dx, dy, z),
+            _axis_product(dx, y, dz),
+            _axis_product(x, ddy, z),
+            _axis_product(x, dy, dz),
+            _axis_product(x, y, ddz),
         ],
         dim=2,
     )
+
+
+def _expand_axis_weights(weights: torch.Tensor) -> torch.Tensor:
+    """Expand [atoms, 6, xyz] weights in the meshgrid stencil's xyz order.
+
+    Evaluate each one-dimensional spline only once, rather than 36 times
+    across the tensor-product stencil. Expand is a view until the final stack.
+    """
+    n = weights.shape[0]
+    shape = (n, 6, 6, 6)
+    return torch.stack(
+        [
+            weights[:, :, 0][:, :, None, None].expand(shape),
+            weights[:, :, 1][:, None, :, None].expand(shape),
+            weights[:, :, 2][:, None, None, :].expand(shape),
+        ],
+        dim=-1,
+    ).reshape(n, 216, 3)
 
 
 def build_pme_geometry_optimized(
@@ -57,7 +155,7 @@ def build_pme_geometry_optimized(
     Nj: torch.Tensor | None = None,
 ) -> dict:
     """Build the shared order-6 spread/gather stencil for one MD structure."""
-    fixed_grid = _fixed_pme_grid(K, coords.device, coords.dtype)
+    fixed_grid = _fixed_pme_grid_rfft(K, coords.device, coords.dtype)
     N = fixed_grid["N"]
     if Nj is None:
         Nj = _get_recip_vectors(N, box)
@@ -69,18 +167,21 @@ def build_pme_geometry_optimized(
     flat_indices = (
         indices[:, :, 0] * ny * nz + indices[:, :, 1] * nz + indices[:, :, 2]
     ).long()
-    u = u0[:, None, :] + shifts
+    axis_shifts = torch.arange(-3, 3, device=coords.device, dtype=coords.dtype)
+    u = u0[:, None, :] + axis_shifts[None, :, None]
     basis = _bspline(u)
-    basis_product = basis.prod(dim=2)
+    x, y, z = basis.unbind(-1)
+    basis_product = _axis_product(x, y, z)
     gradient_weights = None
     hessian_weights = None
     if rank >= 1:
         basis_gradient = _bspline_prime(u)
+        dx, dy, dz = basis_gradient.unbind(-1)
         gradient_weights = torch.stack(
             [
-                basis_gradient[:, :, 0] * basis[:, :, 1] * basis[:, :, 2],
-                basis[:, :, 0] * basis_gradient[:, :, 1] * basis[:, :, 2],
-                basis[:, :, 0] * basis[:, :, 1] * basis_gradient[:, :, 2],
+                _axis_product(dx, y, z),
+                _axis_product(x, dy, z),
+                _axis_product(x, y, dz),
             ],
             dim=2,
         )
@@ -167,6 +268,24 @@ def _gather_with_geometry(
     return phi, field, hessian
 
 
+def _pme_rfft_factors(reciprocal: dict, K: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reuse compact half-spectrum factors within the reciprocal cache lifetime.
+
+    Live-cell reciprocal dictionaries are rebuilt for stress calculations;
+    no tensor is detached here, so NPT derivatives remain on the live graph.
+    Keep multiply then divide unchanged to avoid reassociating float32 math.
+    """
+    if "rfft_coulomb" not in reciprocal:
+        half_z = K // 2 + 1
+        reciprocal["rfft_coulomb"] = (
+            reciprocal["coulomb"].reshape(K, K, K)[:, :, :half_z].contiguous()
+        )
+        reciprocal["rfft_theta_squared"] = (
+            reciprocal["theta_safe"].reshape(K, K, K)[:, :, :half_z].square().contiguous()
+        )
+    return reciprocal["rfft_coulomb"], reciprocal["rfft_theta_squared"]
+
+
 def compute_pme_single_optimized(
     coords: torch.Tensor,
     box: torch.Tensor,
@@ -187,10 +306,8 @@ def compute_pme_single_optimized(
     mesh uses the nonredundant Hermitian half-spectrum, while precomputed
     interpolation weights are reused for spreading and gathering.
     """
-    from .pme import _precompute_pme_reciprocal
-
     if reciprocal_cache is None:
-        reciprocal_cache = _precompute_pme_reciprocal(box, alpha, K)
+        reciprocal_cache = _precompute_pme_reciprocal_rfft(box, alpha, K)
     if geometry_cache is None:
         geometry_cache = build_pme_geometry_optimized(
             coords, box, K, rank=max(rank, int(want_field), 2 * int(want_hessian)),
@@ -203,10 +320,8 @@ def compute_pme_single_optimized(
         Q if rank >= 2 else None,
     )
     structure_factor = torch.fft.rfftn(mesh)
-    half_z = K // 2 + 1
-    coulomb = reciprocal_cache["coulomb"].reshape(K, K, K)[:, :, :half_z]
-    theta = reciprocal_cache["theta_safe"].reshape(K, K, K)[:, :, :half_z]
-    potential_k = coulomb * structure_factor / theta.pow(2)
+    coulomb, theta_squared = _pme_rfft_factors(reciprocal_cache, K)
+    potential_k = coulomb * structure_factor / theta_squared
     potential_grid = torch.fft.irfftn(
         potential_k, s=(K, K, K), norm="forward"
     )
@@ -236,7 +351,7 @@ def _pme_energy_impl(
     n_graphs = int(volume.shape[0])
     energy_parts = []
     reciprocal = (
-        _cached_pme_reciprocal(module, box, [module.alpha], module.mesh_size)[0]
+        _cached_pme_reciprocal_optimized(module, box, [module.alpha], module.mesh_size)[0]
         if geometry_cache is None
         else None
     )
@@ -316,7 +431,7 @@ def _pme_features_impl(
     result = torch.zeros(feats.shape[0], n_out, dtype=feats.dtype, device=feats.device)
     n_graphs = int(box.shape[0])
     reciprocal = (
-        _cached_pme_reciprocal(module, box, module.alphas, module.mesh_size)
+        _cached_pme_reciprocal_optimized(module, box, module.alphas, module.mesh_size)
         if geometry_cache is None
         else None
     )

@@ -11,17 +11,110 @@ from graph_longrange.ewald_optimized import (
 from graph_longrange.features import GTOElectrostaticFeatures
 from graph_longrange.kspace import compute_k_vectors_flat
 from graph_longrange.pme import (
+    _bspline,
+    _bspline_prime,
+    _bspline_double_prime,
+    _get_u_reference,
+    _get_recip_vectors,
+    _make_stencil,
     PMEElectrostaticEnergy,
     PMEElectrostaticFeatures,
     _precompute_pme_reciprocal,
     compute_pme_single,
 )
 from graph_longrange.pme_optimized import (
+    _expand_axis_weights,
+    _pme_rfft_factors,
+    _precompute_pme_reciprocal_rfft,
+    _cached_pme_reciprocal_optimized,
     PMEElectrostaticEnergyOptimized,
     PMEElectrostaticFeaturesOptimized,
     build_pme_geometry_optimized,
     compute_pme_single_optimized,
 )
+
+
+@pytest.mark.parametrize("mesh", [8, 9, 10, 32])
+def test_float32_half_spectrum_matches_full_grid_and_cell_derivatives(mesh):
+    box = torch.tensor([[6., .2, .1], [0., 5.8, .3], [.1, 0., 6.2]],
+                       dtype=torch.float32, requires_grad=True)
+    full = _precompute_pme_reciprocal(box, 1 / 2.4, mesh)
+    half = _precompute_pme_reciprocal_rfft(box, 1 / 2.4, mesh)
+    assert "coulomb" not in half and "theta_safe" not in half
+    fg, ft = _pme_rfft_factors(full, mesh)
+    hg, ht = _pme_rfft_factors(half, mesh)
+    torch.testing.assert_close(hg, fg, atol=1e-7, rtol=1e-6)
+    # A shorter SIMD tail can round a few non-power-of-two entries differently.
+    # This is factor parity, not bitwise identity; output tolerances stay unchanged.
+    torch.testing.assert_close(ht, ft, atol=1e-7, rtol=1e-6)
+    weights = torch.linspace(.1, 1., fg.numel()).reshape_as(fg)
+    expected = torch.autograd.grad((fg * weights).sum(), box, retain_graph=True)[0]
+    actual = torch.autograd.grad((hg * weights).sum(), box)[0]
+    torch.testing.assert_close(actual, expected, atol=1e-7, rtol=1e-6)
+
+
+def test_half_spectrum_cache_invalidates_on_cell_change():
+    module = torch.nn.Module()
+    box = torch.eye(3, dtype=torch.float32).unsqueeze(0) * 6
+    first = _cached_pme_reciprocal_optimized(module, box, [.4], 8)
+    assert _cached_pme_reciprocal_optimized(module, box.clone(), [.4], 8) is first
+    box[0, 0, 0] += .1
+    second = _cached_pme_reciprocal_optimized(module, box, [.4], 8)
+    assert second is not first
+    live = box.clone().requires_grad_()
+    assert _cached_pme_reciprocal_optimized(module, live, [.4], 8) is not second
+    with torch.inference_mode():
+        assert _cached_pme_reciprocal_optimized(module, box.clone(), [.4], 8) is second
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("mesh", [8, 10])
+def test_rfft_factor_reuse_preserves_live_cell_gradients(dtype, mesh):
+    box = torch.tensor(
+        [[6.0, 0.2, 0.1], [0.0, 5.8, 0.3], [0.1, 0.0, 6.2]],
+        dtype=dtype, requires_grad=True,
+    )
+    cache = _precompute_pme_reciprocal(box, 1.0 / 2.4, mesh)
+    green, theta2 = _pme_rfft_factors(cache, mesh)
+    reused_green, reused_theta2 = _pme_rfft_factors(cache, mesh)
+    assert green is reused_green and theta2 is reused_theta2
+    assert green.is_contiguous() and theta2.is_contiguous()
+    expected_green = cache["coulomb"].reshape(mesh, mesh, mesh)[:, :, :mesh // 2 + 1]
+    expected_theta2 = cache["theta_safe"].reshape(mesh, mesh, mesh)[:, :, :mesh // 2 + 1].square()
+    torch.testing.assert_close(green, expected_green, atol=0, rtol=0)
+    torch.testing.assert_close(theta2, expected_theta2, atol=0, rtol=0)
+    expected_grad = torch.autograd.grad(expected_green.sum(), box, retain_graph=True)[0]
+    actual_grad = torch.autograd.grad(green.sum(), box)[0]
+    torch.testing.assert_close(actual_grad, expected_grad, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("n_atoms", [0, 1, 17])
+def test_separable_spline_stencil_preserves_values_and_derivatives(dtype, n_atoms):
+    """Axis expansion retains the original meshgrid order and autograd paths."""
+    torch.manual_seed(82)
+    coords = (torch.rand(n_atoms, 3, dtype=dtype) * 5).requires_grad_()
+    box = torch.tensor(
+        [[6.0, 0.2, 0.1], [0.0, 5.8, 0.3], [0.1, 0.0, 6.2]],
+        dtype=dtype,
+        requires_grad=True,
+    )
+    Nj = _get_recip_vectors(torch.full((3,), 32, dtype=dtype), box)
+    _, u0 = _get_u_reference(coords, Nj, 6)
+    shifts = _make_stencil(6, coords.device, dtype)
+    axis_shifts = torch.arange(-3, 3, dtype=dtype)
+    for spline in (_bspline, _bspline_prime, _bspline_double_prime):
+        expected = spline(u0[:, None, :] + shifts)
+        actual = _expand_axis_weights(spline(u0[:, None, :] + axis_shifts[None, :, None]))
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        # One stencil entry isolates derivative parity from summation-order
+        # differences introduced when 36 repeated axis contributions combine.
+        expected_loss = expected[:, 73, :].sum()
+        actual_loss = actual[:, 73, :].sum()
+        expected_grads = torch.autograd.grad(expected_loss, (coords, box), retain_graph=True)
+        actual_grads = torch.autograd.grad(actual_loss, (coords, box), retain_graph=True)
+        for a, e in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(a, e, atol=0, rtol=0)
 
 
 @pytest.fixture(autouse=True)

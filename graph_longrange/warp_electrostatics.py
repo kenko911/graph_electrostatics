@@ -47,7 +47,10 @@ from functools import partial
 import torch
 
 from .pme import PMEElectrostaticEnergy, PMEElectrostaticFeatures
-from .pme_optimized import _pme_energy_impl, _pme_features_impl
+from .pme_optimized import (
+    _pme_energy_impl, _pme_features_impl, _pme_rfft_factors,
+    _precompute_pme_reciprocal_rfft,
+)
 
 try:
     from nvalchemiops.torch.interactions.electrostatics import (
@@ -323,14 +326,15 @@ def _compute_pme_single_fused_warp(
     differentiable operation while retaining live-cell NPT gradients.
     """
     del geometry_cache  # The Warp primitive builds and fuses its own stencil.
-    from .pme import _precompute_pme_reciprocal
-
     if reciprocal_cache is None:
-        reciprocal_cache = _precompute_pme_reciprocal(box, alpha, K)
+        reciprocal_cache = _precompute_pme_reciprocal_rfft(box, alpha, K)
 
     n_atoms = coords.shape[0]
-    cell = box.unsqueeze(0) if box.dim() == 2 else box
-    cell_inv_batched = torch.linalg.inv_ex(cell)[0]
+    # Nj = (inv(cell) * N).T is already available from reciprocal preparation.
+    # Reuse that differentiable inverse instead of launching a second inverse.
+    cell_inv_batched = (
+        reciprocal_cache["Nj"].T / reciprocal_cache["N"][None, :]
+    ).unsqueeze(0)
     cell_inv_t = cell_inv_batched.transpose(-1, -2).contiguous()
     atom_batch = torch.zeros(n_atoms, dtype=torch.int32, device=coords.device)
     dipoles = p if rank >= 1 and p is not None else torch.zeros_like(coords)
@@ -364,10 +368,8 @@ def _compute_pme_single_fused_warp(
     # This deliberately avoids nvalchemiops' sinc approximation, which defines
     # a measurably different PME discretization at order 6.
     rho_k = torch.fft.rfftn(rho_grid, norm="backward").contiguous()
-    nz_rfft = K // 2 + 1
-    green = reciprocal_cache["coulomb"].reshape(K, K, K)[:, :, :nz_rfft]
-    theta = reciprocal_cache["theta_safe"].reshape(K, K, K)[:, :, :nz_rfft]
-    phi_k = rho_k * green / theta.pow(2)
+    green, theta_squared = _pme_rfft_factors(reciprocal_cache, K)
+    phi_k = rho_k * green / theta_squared
     phi_grid = torch.fft.irfftn(phi_k, s=(K, K, K), norm="forward").to(coords.dtype)
 
     phi, gathered_d, gathered_Q = torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t(

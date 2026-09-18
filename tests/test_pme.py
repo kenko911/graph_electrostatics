@@ -85,14 +85,19 @@ def test_npt_grid_cache_preserves_l2_values_forces_and_cell_gradients(dtype):
         torch.set_default_dtype(previous_default)
 
 
-def test_fused_warp_pme_l2_matches_reference_in_float64():
+@pytest.mark.parametrize("mesh", [8, 10])
+@pytest.mark.parametrize("dtype", [
+    pytest.param(torch.float32, marks=pytest.mark.xfail(
+        reason="Pre-existing float32 toolkit mismatch against stable Torch PME", strict=True)),
+    torch.float64,
+])
+def test_fused_warp_pme_l2_matches_reference(mesh, dtype):
     """Unified Warp spread/gather preserves the order-6 l=2 PME definition and NPT derivatives."""
     pytest.importorskip("nvalchemiops")
     from graph_longrange.warp_electrostatics import _compute_pme_single_fused_warp
 
     torch.manual_seed(322)
-    dtype = torch.float64
-    n_atoms, mesh = 5, 8
+    n_atoms = 5
     coords = (torch.rand(n_atoms, 3, dtype=dtype) * 4.0).requires_grad_()
     box = torch.tensor(
         [[6.1, 0.2, 0.0], [0.1, 5.8, 0.3], [0.0, 0.2, 6.3]], dtype=dtype, requires_grad=True
@@ -111,17 +116,57 @@ def test_fused_warp_pme_l2_matches_reference_in_float64():
     )
     actual = _compute_pme_single_fused_warp(
         coords, box, q, p, alpha, mesh, rank=2, Q=Q,
-        want_field=True, want_hessian=True, reciprocal_cache=reciprocal,
+        want_field=True, want_hessian=True,
     )
+    tolerance = 2e-6 if dtype == torch.float32 else 5e-9
     for actual_value, expected_value in zip(actual, expected):
-        torch.testing.assert_close(actual_value, expected_value, atol=5e-9, rtol=5e-9)
+        torch.testing.assert_close(actual_value, expected_value, atol=tolerance, rtol=tolerance)
 
     weights = tuple(torch.randn_like(value) for value in expected)
     variables = (coords, box, q, p, Q)
     expected_grads = torch.autograd.grad(expected, variables, weights, retain_graph=True)
     actual_grads = torch.autograd.grad(actual, variables, weights)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
-        torch.testing.assert_close(actual_grad, expected_grad, atol=5e-9, rtol=5e-9)
+        torch.testing.assert_close(actual_grad, expected_grad, atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.parametrize("mesh", [8, 10, 32])
+def test_float32_warp_half_spectrum_preserves_full_cache_results(mesh, float32_default_dtype):
+    """Check the speed change independently of the known toolkit/Torch gap."""
+    pytest.importorskip("nvalchemiops")
+    from graph_longrange.warp_electrostatics import _compute_pme_single_fused_warp
+    torch.manual_seed(322)
+    dtype = torch.float32
+    variables = (
+        (torch.rand(5, 3, dtype=dtype) * 4).requires_grad_(),
+        torch.tensor([[6.1, .2, 0.], [.1, 5.8, .3], [0., .2, 6.3]],
+                     dtype=dtype, requires_grad=True),
+        torch.randn(5, dtype=dtype, requires_grad=True),
+        torch.randn(5, 3, dtype=dtype, requires_grad=True),
+        torch.randn(5, 3, 3, dtype=dtype, requires_grad=True),
+    )
+    coords, box, q, p, Q = variables
+    full = pme_module._precompute_pme_reciprocal(box, 1 / 2.4, mesh)
+    args = (coords, box, q, p, 1 / 2.4, mesh, 2)
+    expected = _compute_pme_single_fused_warp(
+        *args, Q=Q, want_field=True, want_hessian=True, reciprocal_cache=full)
+    actual = _compute_pme_single_fused_warp(*args, Q=Q, want_field=True, want_hessian=True)
+    weights = tuple(torch.randn_like(v) for v in expected)
+    eg = torch.autograd.grad(expected, variables, weights, retain_graph=True)
+    ag = torch.autograd.grad(actual, variables, weights)
+    for a, e in zip(actual + ag, expected + eg):
+        torch.testing.assert_close(a, e, atol=1e-6, rtol=1e-6)
+
+
+@pytest.fixture
+def float32_default_dtype():
+    # The toolkit's custom backward assumes the process default matches inputs.
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
 
 
 def test_fused_warp_pme_l2_energy_matches_reference_in_float64():

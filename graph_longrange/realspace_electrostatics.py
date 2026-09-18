@@ -1096,9 +1096,15 @@ class RealSpaceAnalyticalElectrostaticFeatures(torch.nn.Module):
                 self.l2_weight[0],
                 FIELD_CONSTANT / (4.0 * pi),
             )
+            # Must match the non-fused return signature below -- every caller unpacks a
+            # 3-tuple (features, si_terms, None).  Returning a bare tensor here raised
+            # "too many values to unpack" on any CUDA + no_grad() + density_max_l==2 call,
+            # i.e. every energy-only inference path, while force/MD paths (grad enabled)
+            # never entered this branch and so never saw it.
+            si_terms = self.self_interaction(feats)
             if self.include_self_interaction:
-                features = features + self.self_interaction(feats)
-            return features
+                features = features + si_terms
+            return features, si_terms, None
         # For l=0 density with l=1 projection, pad to 4 components
         if self.density_max_l == 0 and self.projection_max_l == 1 and feats.shape[-1] == 1:
             padded = torch.zeros(

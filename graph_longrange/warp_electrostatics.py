@@ -48,7 +48,9 @@ import torch
 
 from .pme import PMEElectrostaticEnergy, PMEElectrostaticFeatures
 from .pme_optimized import (
-    _pme_energy_impl, _pme_features_impl, _pme_rfft_factors,
+    _pme_energy_impl,
+    _pme_features_impl,
+    _pme_rfft_factors,
     _precompute_pme_reciprocal_rfft,
 )
 
@@ -62,6 +64,7 @@ try:
     )
     from ._warp_pme_ops import fractionalize as _graph_pme_fractionalize
     from ._warp_pme_ops import gather_l2_order6_f32 as _graph_pme_gather_l2_order6_f32
+    from ._warp_pme_ops import spread_l2_order6_f32 as _graph_pme_spread_l2_order6_f32
 
     HAS_NVALCHEMIOPS = True
 except Exception:  # pragma: no cover - toolkit optional
@@ -130,14 +133,14 @@ def _moments(feats: torch.Tensor, density_max_l: int) -> torch.Tensor:
 # intentionally stay with the reference classes.
 # ---------------------------------------------------------------------------------------
 def ewald_energy_warp(
-    source_feats: torch.Tensor,     # [N, (l+1)^2] e3nn-packed (or [N, 1, m])
-    node_positions: torch.Tensor,   # [N, 3]
-    cell: torch.Tensor,             # [3, 3] or [B, 3, 3]
+    source_feats: torch.Tensor,  # [N, (l+1)^2] e3nn-packed (or [N, 1, m])
+    node_positions: torch.Tensor,  # [N, 3]
+    cell: torch.Tensor,  # [3, 3] or [B, 3, 3]
     *,
     density_max_l: int,
     density_smearing_width: float,
     k_cutoff: float,
-    batch: torch.Tensor | None = None,   # [N] int, sorted; None for single system
+    batch: torch.Tensor | None = None,  # [N] int, sorted; None for single system
     include_self_interaction: bool = False,
     k_vectors: torch.Tensor | None = None,  # pass the model's k-set for exact parity (single)
 ) -> torch.Tensor:
@@ -201,7 +204,7 @@ def ewald_features_warp(
         feature_max_l=feature_max_l,
         density_normalize="multipoles",
         feature_normalize=integral_normalization,
-        include_self_interaction=True,   # subtract reference-side below instead
+        include_self_interaction=True,  # subtract reference-side below instead
     ).to(feats.dtype)
     if not include_self_interaction:
         from .gto_utils import GTOSelfInteractionBlock
@@ -245,7 +248,7 @@ class PMEElectrostaticEnergyWarp(PMEElectrostaticEnergy):
     # Order 4 is the PME standard, compiles ~10x faster, and only trades a little mesh
     # accuracy (NOT a convention change -- we validate against the exact Ewald oracle).
     SPLINE_ORDER = 4
-    SPLIT_ALPHA = 1.0e8   # effectively alpha = infinity (all interaction in k-space)
+    SPLIT_ALPHA = 1.0e8  # effectively alpha = infinity (all interaction in k-space)
 
     def __init__(self, *args, spline_order: int | None = None, **kwargs):
         _require_toolkit()
@@ -264,11 +267,11 @@ class PMEElectrostaticEnergyWarp(PMEElectrostaticEnergy):
             moments,
             box.squeeze(0) if single else box,
             sigma=self.density_smearing_width,
-            alpha=self.SPLIT_ALPHA,   # NOT self.alpha: reference = alpha->infinity limit
+            alpha=self.SPLIT_ALPHA,  # NOT self.alpha: reference = alpha->infinity limit
             mesh_dimensions=(self.mesh_size, self.mesh_size, self.mesh_size),
             spline_order=self.SPLINE_ORDER,
             batch_idx=None if single else batch.to(torch.int32),
-            volume=volume.reshape(-1),      # tensor keeps cell autograd (stress) alive
+            volume=volume.reshape(-1),  # tensor keeps cell autograd (stress) alive
         )
         energies = torch.zeros(n_graphs, dtype=e_atoms.dtype, device=e_atoms.device)
         energies.index_add_(0, batch, e_atoms)
@@ -278,8 +281,7 @@ class PMEElectrostaticEnergyWarp(PMEElectrostaticEnergy):
         if self.include_self_interaction:
             self_fields = self.self_interaction_terms(feats)
             node_energies = torch.einsum("nb,nb->n", feats, self_fields)
-            self_energy = torch.zeros(n_graphs, dtype=node_energies.dtype,
-                                      device=node_energies.device)
+            self_energy = torch.zeros(n_graphs, dtype=node_energies.dtype, device=node_energies.device)
             self_energy.index_add_(0, batch, node_energies)
             energies = energies + self_energy * 0.5
 
@@ -290,12 +292,8 @@ class PMEElectrostaticEnergyWarp(PMEElectrostaticEnergy):
             is_molecule = torch.all(~pbc, dim=1)
             is_slab = torch.all(torch.logical_xor(slab, pbc), dim=1)
             if is_molecule.any() or is_slab.any():
-                mol_corr = self.monopole_dipole_correction(
-                    feats, node_positions, volume, batch
-                )
-                slab_corr = slab_dipole_correction_energy(
-                    feats, node_positions, volume, batch
-                )
+                mol_corr = self.monopole_dipole_correction(feats, node_positions, volume, batch)
+                slab_corr = slab_dipole_correction_energy(feats, node_positions, volume, batch)
                 corr = torch.zeros_like(mol_corr)
                 corr = torch.where(is_molecule, mol_corr, corr)
                 corr = torch.where(is_slab, slab_corr, corr)
@@ -334,16 +332,12 @@ def _compute_pme_single_fused_warp(
     n_atoms = coords.shape[0]
     # Nj = (inv(cell) * N).T is already available from reciprocal preparation.
     # Reuse that differentiable inverse instead of launching a second inverse.
-    cell_inv_batched = (
-        reciprocal_cache["Nj"].T / reciprocal_cache["N"][None, :]
-    ).unsqueeze(0)
+    cell_inv_batched = (reciprocal_cache["Nj"].T / reciprocal_cache["N"][None, :]).unsqueeze(0)
     cell_inv_t = cell_inv_batched.transpose(-1, -2).contiguous()
     atom_batch = torch.zeros(n_atoms, dtype=torch.int32, device=coords.device)
     dipoles = p if rank >= 1 and p is not None else torch.zeros_like(coords)
     quadrupoles = (
-        Q
-        if rank >= 2 and Q is not None
-        else torch.zeros((n_atoms, 3, 3), dtype=coords.dtype, device=coords.device)
+        Q if rank >= 2 and Q is not None else torch.zeros((n_atoms, 3, 3), dtype=coords.dtype, device=coords.device)
     )
     p_frac, d_frac, q_frac = _graph_pme_fractionalize(
         coords,
@@ -353,18 +347,22 @@ def _compute_pme_single_fused_warp(
         atom_batch,
     )
     identity_cell = torch.eye(3, dtype=coords.dtype, device=coords.device).unsqueeze(0)
-    rho_grid = torch.ops.nvalchemiops.multipole_pme_spread_unified(
-        p_frac,
-        q,
-        d_frac,
-        q_frac,
-        identity_cell,
-        K,
-        K,
-        K,
-        spline_order,
-        rank,
-    )
+    use_graph_stencil = coords.dtype == torch.float32 and spline_order == 6 and rank == 2
+    if use_graph_stencil:
+        rho_grid = _graph_pme_spread_l2_order6_f32(p_frac, q, d_frac, q_frac, K, K, K)
+    else:
+        rho_grid = torch.ops.nvalchemiops.multipole_pme_spread_unified(
+            p_frac,
+            q,
+            d_frac,
+            q_frac,
+            identity_cell,
+            K,
+            K,
+            K,
+            spline_order,
+            rank,
+        )
 
     # Use rFFT for the real mesh but retain the exact reference Green factors.
     # This deliberately avoids nvalchemiops' sinc approximation, which defines
@@ -374,22 +372,18 @@ def _compute_pme_single_fused_warp(
     phi_k = rho_k * green / theta_squared
     phi_grid = torch.fft.irfftn(phi_k, s=(K, K, K), norm="forward").to(coords.dtype)
 
-    if coords.dtype == torch.float32 and spline_order == 6 and rank == 2:
-        phi, gathered_d, gathered_Q = _graph_pme_gather_l2_order6_f32(
-            phi_grid, p_frac
-        )
+    if use_graph_stencil:
+        phi, gathered_d, gathered_Q = _graph_pme_gather_l2_order6_f32(phi_grid, p_frac)
     else:
-        phi, gathered_d, gathered_Q = (
-            torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t(
-                phi_grid,
-                p_frac,
-                identity_cell,
-                K,
-                K,
-                K,
-                spline_order,
-                rank,
-            )
+        phi, gathered_d, gathered_Q = torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t(
+            phi_grid,
+            p_frac,
+            identity_cell,
+            K,
+            K,
+            K,
+            spline_order,
+            rank,
         )
     want_field_actual = want_field or rank >= 1
     want_hessian_actual = want_hessian or rank >= 2
@@ -399,11 +393,7 @@ def _compute_pme_single_fused_warp(
     # with the Hessian going as A^-1 H A^-T.  Both were transposed.  Identical for an orthogonal
     # cell (A diagonal), wrong on a triclinic one -- same class of bug as the torch gather.
     field = (-gathered_d @ cell_inv.T) if want_field_actual else None
-    hessian = (
-        torch.einsum("ac,ncd,bd->nab", cell_inv, 2.0 * gathered_Q, cell_inv)
-        if want_hessian_actual
-        else None
-    )
+    hessian = torch.einsum("ac,ncd,bd->nab", cell_inv, 2.0 * gathered_Q, cell_inv) if want_hessian_actual else None
     return phi, field, hessian
 
 
@@ -482,7 +472,7 @@ class PMEElectrostaticFeaturesWarp(PMEElectrostaticFeatures):
         density_smearing_width: float,
         feature_max_l: int,
         feature_smearing_widths: list[float],
-        mesh_size: int,                       # unused by the direct-k path; kept for API parity
+        mesh_size: int,  # unused by the direct-k path; kept for API parity
         include_self_interaction: bool = False,
         integral_normalization: str = "receiver",
         *,
@@ -519,7 +509,7 @@ class PMEElectrostaticFeaturesWarp(PMEElectrostaticFeatures):
             feature_max_l=self.feature_max_l,
             density_normalize="multipoles",
             feature_normalize=self._integral_normalization,
-            include_self_interaction=True,   # subtract reference-side below instead
+            include_self_interaction=True,  # subtract reference-side below instead
         ).to(feats.dtype)
         if not self.include_self_interaction:
             # parent's block has exactly the reference l<=2 self constants

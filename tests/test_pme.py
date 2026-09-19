@@ -36,8 +36,8 @@ BOX_L = 10.0
 SIGMA_SRC = 1.2
 SIGMA_PROJ = [1.0, 1.5]
 
-PME_RTOL = 5e-3   # 0.5 %
-PME_ATOL = 0.1    # absolute, for small features
+PME_RTOL = 5e-3  # 0.5 %
+PME_ATOL = 0.1  # absolute, for small features
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
@@ -49,9 +49,7 @@ def test_npt_grid_cache_preserves_l2_values_forces_and_cell_gradients(dtype):
         torch.manual_seed(321)
         n_atoms, mesh = 4, 8
         base_coords = torch.rand(n_atoms, 3, dtype=dtype) * 4.0
-        base_box = torch.tensor(
-            [[6.1, 0.2, 0.0], [0.1, 5.8, 0.3], [0.0, 0.2, 6.3]], dtype=dtype
-        )
+        base_box = torch.tensor([[6.1, 0.2, 0.0], [0.1, 5.8, 0.3], [0.0, 0.2, 6.3]], dtype=dtype)
         base_q = torch.randn(n_atoms, dtype=dtype)
         base_p = torch.randn(n_atoms, 3, dtype=dtype)
         base_Q = torch.randn(n_atoms, 3, 3, dtype=dtype)
@@ -63,16 +61,24 @@ def test_npt_grid_cache_preserves_l2_values_forces_and_cell_gradients(dtype):
 
         def evaluate(use_python_grid_shape):
             variables = tuple(
-                value.clone().requires_grad_()
-                for value in (base_coords, base_box, base_q, base_p, base_Q)
+                value.clone().requires_grad_() for value in (base_coords, base_box, base_q, base_p, base_Q)
             )
             coords, box, q, p, Q = variables
             reciprocal = pme_module._precompute_pme_reciprocal(box, 1.0 / 2.4, mesh)
             if not use_python_grid_shape:
                 reciprocal = {key: value for key, value in reciprocal.items() if key != "grid_shape"}
             output = pme_module.compute_pme_single(
-                coords, box, q, p, 1.0 / 2.4, mesh, rank=2, Q=Q,
-                want_field=True, want_hessian=True, reciprocal_cache=reciprocal,
+                coords,
+                box,
+                q,
+                p,
+                1.0 / 2.4,
+                mesh,
+                rank=2,
+                Q=Q,
+                want_field=True,
+                want_hessian=True,
+                reciprocal_cache=reciprocal,
             )
             gradients = torch.autograd.grad(output, variables, weights)
             return output, gradients
@@ -90,16 +96,15 @@ def test_npt_grid_cache_preserves_l2_values_forces_and_cell_gradients(dtype):
 def test_fused_warp_pme_l2_matches_reference(mesh, dtype, warp_input_default_dtype):
     """Unified Warp spread/gather preserves the order-6 l=2 PME definition and NPT derivatives."""
     pytest.importorskip("nvalchemiops")
-    from nvalchemiops.math import spline
-    if dtype == torch.float32 and not hasattr(spline, "_bspline6_local"):
-        pytest.xfail("Installed toolkit lacks the stable order-6 spline fix")
     from graph_longrange.warp_electrostatics import _compute_pme_single_fused_warp
 
     torch.manual_seed(322)
     n_atoms = 5
     coords = (torch.rand(n_atoms, 3, dtype=dtype) * 4.0).requires_grad_()
     box = torch.tensor(
-        [[6.1, 0.2, 0.0], [0.1, 5.8, 0.3], [0.0, 0.2, 6.3]], dtype=dtype, requires_grad=True
+        [[6.1, 0.2, 0.0], [0.1, 5.8, 0.3], [0.0, 0.2, 6.3]],
+        dtype=dtype,
+        requires_grad=True,
     )
     q = torch.randn(n_atoms, dtype=dtype, requires_grad=True)
     p = torch.randn(n_atoms, 3, dtype=dtype, requires_grad=True)
@@ -110,12 +115,29 @@ def test_fused_warp_pme_l2_matches_reference(mesh, dtype, warp_input_default_dty
     alpha = 1.0 / 2.4
     reciprocal = pme_module._precompute_pme_reciprocal(box, alpha, mesh)
     expected = pme_module.compute_pme_single(
-        coords, box, q, p, alpha, mesh, rank=2, Q=Q,
-        want_field=True, want_hessian=True, reciprocal_cache=reciprocal,
+        coords,
+        box,
+        q,
+        p,
+        alpha,
+        mesh,
+        rank=2,
+        Q=Q,
+        want_field=True,
+        want_hessian=True,
+        reciprocal_cache=reciprocal,
     )
     actual = _compute_pme_single_fused_warp(
-        coords, box, q, p, alpha, mesh, rank=2, Q=Q,
-        want_field=True, want_hessian=True,
+        coords,
+        box,
+        q,
+        p,
+        alpha,
+        mesh,
+        rank=2,
+        Q=Q,
+        want_field=True,
+        want_hessian=True,
     )
     tolerance = 2e-6 if dtype == torch.float32 else 5e-9
     for actual_value, expected_value in zip(actual, expected):
@@ -129,46 +151,68 @@ def test_fused_warp_pme_l2_matches_reference(mesh, dtype, warp_input_default_dty
         torch.testing.assert_close(actual_grad, expected_grad, atol=tolerance, rtol=tolerance)
 
 
-def test_graph_owned_gather_matches_toolkit_through_double_backward(
+def test_graph_owned_gather_matches_stable_torch_through_double_backward(
     float32_default_dtype,
 ):
     """The graph-owned MD specialization preserves first and second derivatives."""
     pytest.importorskip("nvalchemiops")
-    from graph_longrange._warp_pme_ops import gather_l2_order6_f32
+    from graph_longrange._warp_pme_ops import (
+        _stable_gather_torch,
+        gather_l2_order6_f32,
+    )
 
     torch.manual_seed(825)
     phi = torch.randn(8, 8, 8, dtype=torch.float32, requires_grad=True)
     positions = torch.rand(7, 3, dtype=torch.float32, requires_grad=True)
-    identity = torch.eye(3, dtype=torch.float32).unsqueeze(0)
-
-    expected = torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t(
-        phi, positions, identity, 8, 8, 8, 6, 2
-    )
+    expected = _stable_gather_torch(phi, positions)
     actual = gather_l2_order6_f32(phi, positions)
     weights = tuple(torch.randn_like(value) for value in expected)
-    expected_first = torch.autograd.grad(
-        expected, (phi, positions), weights, create_graph=True, retain_graph=True
-    )
-    actual_first = torch.autograd.grad(
-        actual, (phi, positions), weights, create_graph=True, retain_graph=True
-    )
+    expected_first = torch.autograd.grad(expected, (phi, positions), weights, create_graph=True, retain_graph=True)
+    actual_first = torch.autograd.grad(actual, (phi, positions), weights, create_graph=True, retain_graph=True)
     grad_grad = tuple(torch.randn_like(value) for value in expected_first)
-    expected_second = torch.autograd.grad(
-        expected_first, (phi, positions), grad_grad, retain_graph=True
-    )
-    actual_second = torch.autograd.grad(
-        actual_first, (phi, positions), grad_grad
-    )
+    expected_second = torch.autograd.grad(expected_first, (phi, positions), grad_grad, retain_graph=True)
+    actual_second = torch.autograd.grad(actual_first, (phi, positions), grad_grad)
 
     for observed, reference in zip(actual + actual_first, expected + expected_first):
+        torch.testing.assert_close(observed, reference, atol=5e-6, rtol=8e-6)
+    for observed, reference in zip(actual_second, expected_second):
+        torch.testing.assert_close(observed, reference, atol=3e-5, rtol=2e-5)
+
+
+def test_graph_owned_spread_matches_stable_torch_through_double_backward(
+    float32_default_dtype,
+):
+    """Graph-owned spreading is independent of toolkit spline implementations."""
+    pytest.importorskip("nvalchemiops")
+    from graph_longrange._warp_pme_ops import (
+        _stable_spread_torch,
+        spread_l2_order6_f32,
+    )
+
+    torch.manual_seed(827)
+    positions = torch.rand(7, 3, dtype=torch.float32, requires_grad=True)
+    charges = torch.randn(7, dtype=torch.float32, requires_grad=True)
+    dipoles = torch.randn(7, 3, dtype=torch.float32, requires_grad=True)
+    quadrupoles_data = torch.randn(7, 3, 3, dtype=torch.float32)
+    quadrupoles = (0.5 * (quadrupoles_data + quadrupoles_data.transpose(-1, -2))).requires_grad_()
+    variables = (positions, charges, dipoles, quadrupoles)
+
+    expected = _stable_spread_torch(*variables, (8, 8, 8))
+    actual = spread_l2_order6_f32(*variables, 8, 8, 8)
+    weight = torch.randn_like(expected, requires_grad=True)
+    expected_first = torch.autograd.grad(expected, variables, weight, create_graph=True, retain_graph=True)
+    actual_first = torch.autograd.grad(actual, variables, weight, create_graph=True, retain_graph=True)
+    grad_grad = tuple(torch.randn_like(value) for value in expected_first)
+    expected_second = torch.autograd.grad(expected_first, (weight,) + variables, grad_grad, retain_graph=True)
+    actual_second = torch.autograd.grad(actual_first, (weight,) + variables, grad_grad)
+
+    for observed, reference in zip((actual,) + actual_first, (expected,) + expected_first):
         torch.testing.assert_close(observed, reference, atol=4e-6, rtol=4e-6)
     for observed, reference in zip(actual_second, expected_second):
         torch.testing.assert_close(observed, reference, atol=3e-5, rtol=2e-5)
 
 
-def test_graph_owned_fractionalize_reduced_cell_gradient_matches_toolkit(
-    float32_default_dtype, monkeypatch
-):
+def test_graph_owned_fractionalize_reduced_cell_gradient_matches_toolkit(float32_default_dtype, monkeypatch):
     """The CUDA cell-gradient reduction is numerically faithful in float32."""
     pytest.importorskip("nvalchemiops")
     from graph_longrange import _warp_pme_ops
@@ -178,29 +222,20 @@ def test_graph_owned_fractionalize_reduced_cell_gradient_matches_toolkit(
     torch.manual_seed(826)
     positions = torch.randn(17, 3, dtype=torch.float32, requires_grad=True)
     cell_inv_t = (
-        torch.eye(3, dtype=torch.float32).unsqueeze(0)
-        + 0.05 * torch.randn(1, 3, 3, dtype=torch.float32)
+        torch.eye(3, dtype=torch.float32).unsqueeze(0) + 0.05 * torch.randn(1, 3, 3, dtype=torch.float32)
     ).requires_grad_()
     dipoles = torch.randn(17, 3, dtype=torch.float32, requires_grad=True)
     quadrupoles = torch.randn(17, 3, 3, dtype=torch.float32, requires_grad=True)
     batch = torch.zeros(17, dtype=torch.int32)
     variables = (positions, cell_inv_t, dipoles, quadrupoles)
 
-    expected = torch.ops.nvalchemiops.multipole_pme_fractionalize(
-        *variables, batch
-    )
+    expected = torch.ops.nvalchemiops.multipole_pme_fractionalize(*variables, batch)
     actual = _warp_pme_ops.fractionalize(*variables, batch)
     weights = tuple(torch.randn_like(value) for value in expected)
-    expected_first = torch.autograd.grad(
-        expected, variables, weights, create_graph=True, retain_graph=True
-    )
-    actual_first = torch.autograd.grad(
-        actual, variables, weights, create_graph=True, retain_graph=True
-    )
+    expected_first = torch.autograd.grad(expected, variables, weights, create_graph=True, retain_graph=True)
+    actual_first = torch.autograd.grad(actual, variables, weights, create_graph=True, retain_graph=True)
     grad_grad = tuple(torch.randn_like(value) for value in expected_first)
-    expected_second = torch.autograd.grad(
-        expected_first, variables, grad_grad, retain_graph=True
-    )
+    expected_second = torch.autograd.grad(expected_first, variables, grad_grad, retain_graph=True)
     actual_second = torch.autograd.grad(actual_first, variables, grad_grad)
 
     for observed, reference in zip(actual + actual_first, expected + expected_first):
@@ -224,12 +259,16 @@ def test_float32_warp_half_spectrum_preserves_full_cache_results(mesh, float32_d
     """Check the speed change independently of the known toolkit/Torch gap."""
     pytest.importorskip("nvalchemiops")
     from graph_longrange.warp_electrostatics import _compute_pme_single_fused_warp
+
     torch.manual_seed(322)
     dtype = torch.float32
     variables = (
         (torch.rand(5, 3, dtype=dtype) * 4).requires_grad_(),
-        torch.tensor([[6.1, .2, 0.], [.1, 5.8, .3], [0., .2, 6.3]],
-                     dtype=dtype, requires_grad=True),
+        torch.tensor(
+            [[6.1, 0.2, 0.0], [0.1, 5.8, 0.3], [0.0, 0.2, 6.3]],
+            dtype=dtype,
+            requires_grad=True,
+        ),
         torch.randn(5, dtype=dtype, requires_grad=True),
         torch.randn(5, 3, dtype=dtype, requires_grad=True),
         torch.randn(5, 3, 3, dtype=dtype, requires_grad=True),
@@ -237,8 +276,7 @@ def test_float32_warp_half_spectrum_preserves_full_cache_results(mesh, float32_d
     coords, box, q, p, Q = variables
     full = pme_module._precompute_pme_reciprocal(box, 1 / 2.4, mesh)
     args = (coords, box, q, p, 1 / 2.4, mesh, 2)
-    expected = _compute_pme_single_fused_warp(
-        *args, Q=Q, want_field=True, want_hessian=True, reciprocal_cache=full)
+    expected = _compute_pme_single_fused_warp(*args, Q=Q, want_field=True, want_hessian=True, reciprocal_cache=full)
     actual = _compute_pme_single_fused_warp(*args, Q=Q, want_field=True, want_hessian=True)
     weights = tuple(torch.randn_like(v) for v in expected)
     eg = torch.autograd.grad(expected, variables, weights, retain_graph=True)
@@ -299,10 +337,6 @@ def test_graph_owned_float32_warp_pme_energy_matches_reference_at_mesh32(
 ):
     """Production-mesh energy, force, stress, and source VJPs remain close."""
     pytest.importorskip("nvalchemiops")
-    from nvalchemiops.math import spline
-
-    if not hasattr(spline, "_bspline6_local"):
-        pytest.xfail("Installed toolkit lacks the stable order-6 spread spline")
     from graph_longrange.warp_electrostatics import PMEElectrostaticEnergyWarpPME
 
     torch.manual_seed(323)
@@ -324,15 +358,9 @@ def test_graph_owned_float32_warp_pme_energy_matches_reference_at_mesh32(
         "include_self_interaction": True,
     }
 
-    expected = PMEElectrostaticEnergy(**kwargs)(
-        source, coords, batch, box, volume, pbc
-    )
-    actual = PMEElectrostaticEnergyWarpPME(**kwargs, spline_order=6)(
-        source, coords, batch, box, volume, pbc
-    )
-    expected_grads = torch.autograd.grad(
-        expected, (coords, box, source), retain_graph=True
-    )
+    expected = PMEElectrostaticEnergy(**kwargs)(source, coords, batch, box, volume, pbc)
+    actual = PMEElectrostaticEnergyWarpPME(**kwargs, spline_order=6)(source, coords, batch, box, volume, pbc)
+    expected_grads = torch.autograd.grad(expected, (coords, box, source), retain_graph=True)
     actual_grads = torch.autograd.grad(actual, (coords, box, source))
 
     compared = zip((actual,) + actual_grads, (expected,) + expected_grads)
@@ -341,6 +369,7 @@ def test_graph_owned_float32_warp_pme_energy_matches_reference_at_mesh32(
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
 
 def _make_cell(L: float):
     """Returns (cell [1,3,3], rcell [1,3,3]) using the PHYSICAL 2π convention."""
@@ -356,6 +385,7 @@ def _kspace_inputs(cell, rcell, kcut=KCUT):
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
+
 @pytest.fixture(scope="module")
 def neutral_l0_system():
     torch.manual_seed(42)
@@ -367,11 +397,20 @@ def neutral_l0_system():
     cell, rcell = _make_cell(BOX_L)
     volume = torch.tensor([BOX_L**3])
     pbc = torch.tensor([[True, True, True]])
-    box = cell   # [1, 3, 3]
+    box = cell  # [1, 3, 3]
     k_vecs, k_norm2, k_batch, k0_mask = _kspace_inputs(cell, rcell)
-    return dict(positions=positions, batch=batch, source_feats=source_feats,
-                volume=volume, pbc=pbc, box=box,
-                k_vecs=k_vecs, k_norm2=k_norm2, k_batch=k_batch, k0_mask=k0_mask)
+    return dict(
+        positions=positions,
+        batch=batch,
+        source_feats=source_feats,
+        volume=volume,
+        pbc=pbc,
+        box=box,
+        k_vecs=k_vecs,
+        k_norm2=k_norm2,
+        k_batch=k_batch,
+        k0_mask=k0_mask,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -380,20 +419,31 @@ def neutral_l1_system():
     n = 4
     positions = torch.rand(n, 3) * (BOX_L * 0.6) + BOX_L * 0.2
     batch = torch.zeros(n, dtype=torch.long)
-    source_feats = torch.tensor([
-        [ 1.0,  0.1,  0.2,  0.3],
-        [-1.0,  0.05, -0.1,  0.2],
-        [ 0.5, -0.15,  0.1, -0.1],
-        [-0.5,  0.0,  -0.2, -0.4],
-    ])
+    source_feats = torch.tensor(
+        [
+            [1.0, 0.1, 0.2, 0.3],
+            [-1.0, 0.05, -0.1, 0.2],
+            [0.5, -0.15, 0.1, -0.1],
+            [-0.5, 0.0, -0.2, -0.4],
+        ]
+    )
     cell, rcell = _make_cell(BOX_L)
     volume = torch.tensor([BOX_L**3])
     pbc = torch.tensor([[True, True, True]])
     box = cell
     k_vecs, k_norm2, k_batch, k0_mask = _kspace_inputs(cell, rcell)
-    return dict(positions=positions, batch=batch, source_feats=source_feats,
-                volume=volume, pbc=pbc, box=box,
-                k_vecs=k_vecs, k_norm2=k_norm2, k_batch=k_batch, k0_mask=k0_mask)
+    return dict(
+        positions=positions,
+        batch=batch,
+        source_feats=source_feats,
+        volume=volume,
+        pbc=pbc,
+        box=box,
+        k_vecs=k_vecs,
+        k_norm2=k_norm2,
+        k_batch=k_batch,
+        k0_mask=k0_mask,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -403,9 +453,8 @@ def batch_l0_system():
     pos0 = torch.rand(n_per, 3) * (BOX_L * 0.5) + BOX_L * 0.25
     pos1 = torch.rand(n_per, 3) * (BOX_L * 0.5) + BOX_L * 0.25
     positions = torch.cat([pos0, pos1], dim=0)
-    batch = torch.cat([torch.zeros(n_per, dtype=torch.long),
-                       torch.ones(n_per, dtype=torch.long)])
-    q = torch.tensor([1.0, -0.5, -0.5,  0.8, -0.4, -0.4])
+    batch = torch.cat([torch.zeros(n_per, dtype=torch.long), torch.ones(n_per, dtype=torch.long)])
+    q = torch.tensor([1.0, -0.5, -0.5, 0.8, -0.4, -0.4])
     source_feats = q.unsqueeze(-1)
     cell, rcell = _make_cell(BOX_L)
     cell = cell.expand(2, 3, 3).contiguous()
@@ -414,9 +463,18 @@ def batch_l0_system():
     pbc = torch.tensor([[True, True, True], [True, True, True]])
     box = cell
     k_vecs, k_norm2, k_batch, k0_mask = _kspace_inputs(cell, rcell)
-    return dict(positions=positions, batch=batch, source_feats=source_feats,
-                volume=volume, pbc=pbc, box=box,
-                k_vecs=k_vecs, k_norm2=k_norm2, k_batch=k_batch, k0_mask=k0_mask)
+    return dict(
+        positions=positions,
+        batch=batch,
+        source_feats=source_feats,
+        volume=volume,
+        pbc=pbc,
+        box=box,
+        k_vecs=k_vecs,
+        k_norm2=k_norm2,
+        k_batch=k_batch,
+        k0_mask=k0_mask,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -427,49 +485,72 @@ def neutral_l2_system():
     positions = torch.rand(n, 3) * (BOX_L * 0.6) + BOX_L * 0.2
     batch = torch.zeros(n, dtype=torch.long)
     q = torch.tensor([1.0, -1.0, 0.5, -0.8, 0.3])
-    q = q - q.mean()                                   # neutral
-    p = torch.randn(n, 3) * 0.3                         # l=1 (real-SH order m=-1,0,+1)
-    quad = torch.randn(n, 5) * 0.4                      # l=2 (real-SH order m=-2..+2)
+    q = q - q.mean()  # neutral
+    p = torch.randn(n, 3) * 0.3  # l=1 (real-SH order m=-1,0,+1)
+    quad = torch.randn(n, 5) * 0.4  # l=2 (real-SH order m=-2..+2)
     source_feats = torch.cat([q.unsqueeze(-1), p, quad], dim=-1)  # [n, 9]
     cell, rcell = _make_cell(BOX_L)
     volume = torch.tensor([BOX_L**3])
     pbc = torch.tensor([[True, True, True]])
     box = cell
     k_vecs, k_norm2, k_batch, k0_mask = _kspace_inputs(cell, rcell)
-    return dict(positions=positions, batch=batch, source_feats=source_feats,
-                volume=volume, pbc=pbc, box=box,
-                k_vecs=k_vecs, k_norm2=k_norm2, k_batch=k_batch, k0_mask=k0_mask)
+    return dict(
+        positions=positions,
+        batch=batch,
+        source_feats=source_feats,
+        volume=volume,
+        pbc=pbc,
+        box=box,
+        k_vecs=k_vecs,
+        k_norm2=k_norm2,
+        k_batch=k_batch,
+        k0_mask=k0_mask,
+    )
 
 
 # ── energy tests ──────────────────────────────────────────────────────────────
 
-class TestPMEEnergy:
 
+class TestPMEEnergy:
     def _ref(self, l, si):
         return GTOElectrostaticEnergy(
-            density_max_l=l, density_smearing_width=SIGMA_SRC,
-            kspace_cutoff=KCUT, include_self_interaction=si,
+            density_max_l=l,
+            density_smearing_width=SIGMA_SRC,
+            kspace_cutoff=KCUT,
+            include_self_interaction=si,
             include_pbc_corrections=False,
         )
 
     def _pme(self, l, si):
         return PMEElectrostaticEnergy(
-            density_max_l=l, density_smearing_width=SIGMA_SRC,
-            mesh_size=MESH, include_self_interaction=si,
+            density_max_l=l,
+            density_smearing_width=SIGMA_SRC,
+            mesh_size=MESH,
+            include_self_interaction=si,
             include_pbc_corrections=False,
         )
 
     def _run_ref(self, model, sys):
         return model(
-            sys["k_vecs"], sys["k_norm2"], sys["k_batch"], sys["k0_mask"],
-            sys["source_feats"], sys["positions"], sys["batch"],
-            sys["volume"], sys["pbc"],
+            sys["k_vecs"],
+            sys["k_norm2"],
+            sys["k_batch"],
+            sys["k0_mask"],
+            sys["source_feats"],
+            sys["positions"],
+            sys["batch"],
+            sys["volume"],
+            sys["pbc"],
         )
 
     def _run_pme(self, model, sys):
         return model(
-            sys["source_feats"], sys["positions"], sys["batch"],
-            sys["box"], sys["volume"], sys["pbc"],
+            sys["source_feats"],
+            sys["positions"],
+            sys["batch"],
+            sys["box"],
+            sys["volume"],
+            sys["pbc"],
         )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -506,8 +587,14 @@ class TestPMEEnergy:
         sf = torch.tensor([[1.0], [-1.0]])
         box = (torch.eye(3) * L).unsqueeze(0)
         pmc = PMEElectrostaticEnergy(0, sigma, MESH, include_pbc_corrections=False)
-        E = pmc(sf, pos, batch, box, torch.tensor([L**3]),
-                torch.tensor([[True, True, True]]))
+        E = pmc(
+            sf,
+            pos,
+            batch,
+            box,
+            torch.tensor([L**3]),
+            torch.tensor([[True, True, True]]),
+        )
         assert E.item() < 0.0, f"Expected E < 0, got {E.item()}"
 
     def test_energy_zero_for_zero_charges(self):
@@ -516,17 +603,28 @@ class TestPMEEnergy:
         sf = torch.zeros(3, 1)
         box = (torch.eye(3) * 10.0).unsqueeze(0)
         pmc = PMEElectrostaticEnergy(0, SIGMA_SRC, MESH, include_pbc_corrections=False)
-        E = pmc(sf, pos, batch, box, torch.tensor([1000.0]),
-                torch.tensor([[True, True, True]]))
+        E = pmc(
+            sf,
+            pos,
+            batch,
+            box,
+            torch.tensor([1000.0]),
+            torch.tensor([[True, True, True]]),
+        )
         assert abs(E.item()) < 1e-8
 
     def test_non_pbc_uses_realspace(self, neutral_l0_system):
         """When pbc=False, PME falls back to real-space (finite but ~-4 to -6 range)."""
         pmc = self._pme(0, False)
         sys = neutral_l0_system
-        E = pmc(sys["source_feats"], sys["positions"], sys["batch"],
-                sys["box"], sys["volume"],
-                torch.zeros(1, 3, dtype=torch.bool))
+        E = pmc(
+            sys["source_feats"],
+            sys["positions"],
+            sys["batch"],
+            sys["box"],
+            sys["volume"],
+            torch.zeros(1, 3, dtype=torch.bool),
+        )
         assert torch.isfinite(E).all()
 
     def test_energy_matches_analytic_pair(self):
@@ -535,46 +633,64 @@ class TestPMEEnergy:
         PBC corrections negligible for large box.
         """
         from graph_longrange.utils import FIELD_CONSTANT
+
         sigma, L, r = 1.0, 30.0, 4.0
         pos = torch.tensor([[0.0, 0.0, 0.0], [r, 0.0, 0.0]])
         batch = torch.zeros(2, dtype=torch.long)
         sf = torch.tensor([[1.0], [-1.0]])
         box = (torch.eye(3) * L).unsqueeze(0)
-        E_analytic = FIELD_CONSTANT / (4*math.pi) * (-1.0) * math.erf(r / (2*sigma)) / r
+        E_analytic = FIELD_CONSTANT / (4 * math.pi) * (-1.0) * math.erf(r / (2 * sigma)) / r
 
         pmc = PMEElectrostaticEnergy(0, sigma, 48, include_pbc_corrections=False)
-        E = pmc(sf, pos, batch, box, torch.tensor([L**3]),
-                torch.tensor([[True, True, True]]))
+        E = pmc(
+            sf,
+            pos,
+            batch,
+            box,
+            torch.tensor([L**3]),
+            torch.tensor([[True, True, True]]),
+        )
         # PME is the periodic sum; for large neutral box it ≈ isolated pair
-        assert abs(E.item() - E_analytic) / abs(E_analytic) < 0.02, \
-            f"PME={E.item():.6f}, analytic={E_analytic:.6f}"
+        assert abs(E.item() - E_analytic) / abs(E_analytic) < 0.02, f"PME={E.item():.6f}, analytic={E_analytic:.6f}"
 
 
 # ── feature tests ─────────────────────────────────────────────────────────────
 
-class TestPMEFeatures:
 
+class TestPMEFeatures:
     def _ref(self, dl, pl, norm="receiver"):
         return GTOElectrostaticFeatures(
-            density_max_l=dl, density_smearing_width=SIGMA_SRC,
-            feature_max_l=pl, feature_smearing_widths=SIGMA_PROJ,
-            include_self_interaction=False, kspace_cutoff=KCUT,
+            density_max_l=dl,
+            density_smearing_width=SIGMA_SRC,
+            feature_max_l=pl,
+            feature_smearing_widths=SIGMA_PROJ,
+            include_self_interaction=False,
+            kspace_cutoff=KCUT,
             integral_normalization=norm,
         )
 
     def _pme(self, dl, pl, norm="receiver"):
         return PMEElectrostaticFeatures(
-            density_max_l=dl, density_smearing_width=SIGMA_SRC,
-            feature_max_l=pl, feature_smearing_widths=SIGMA_PROJ,
-            mesh_size=MESH, include_self_interaction=False,
+            density_max_l=dl,
+            density_smearing_width=SIGMA_SRC,
+            feature_max_l=pl,
+            feature_smearing_widths=SIGMA_PROJ,
+            mesh_size=MESH,
+            include_self_interaction=False,
             integral_normalization=norm,
         )
 
     def _run_ref(self, model, sys):
         return model(
-            sys["k_vecs"], sys["k_norm2"], sys["k_batch"], sys["k0_mask"],
-            sys["source_feats"], sys["positions"], sys["batch"],
-            sys["volume"], sys["pbc"],
+            sys["k_vecs"],
+            sys["k_norm2"],
+            sys["k_batch"],
+            sys["k0_mask"],
+            sys["source_feats"],
+            sys["positions"],
+            sys["batch"],
+            sys["volume"],
+            sys["pbc"],
         )
 
     def _run_pme(self, model, sys):
@@ -588,30 +704,30 @@ class TestPMEFeatures:
     def _pick(dl, l0, l1, l2):
         return {0: l0, 1: l1, 2: l2}[dl]
 
-    @pytest.mark.parametrize("dl,pl", [(0, 0), (1, 0), (0, 1), (1, 1),
-                                       (0, 2), (1, 2), (2, 2)])
-    def test_feature_shapes(self, neutral_l0_system, neutral_l1_system,
-                            neutral_l2_system, dl, pl):
+    @pytest.mark.parametrize("dl,pl", [(0, 0), (1, 0), (0, 1), (1, 1), (0, 2), (1, 2), (2, 2)])
+    def test_feature_shapes(self, neutral_l0_system, neutral_l1_system, neutral_l2_system, dl, pl):
         sys = self._pick(dl, neutral_l0_system, neutral_l1_system, neutral_l2_system)
         out = self._run_pme(self._pme(dl, pl), sys)
         n = sys["positions"].shape[0]
         expected = (pl + 1) ** 2 * len(SIGMA_PROJ)
         assert out.shape == (n, expected)
 
-    @pytest.mark.parametrize("dl,pl,norm", [
-        (0, 0, "receiver"),
-        (1, 0, "receiver"),
-        (0, 1, "receiver"),
-        (1, 1, "receiver"),
-        (1, 1, "multipoles"),
-        # quadrupole feature path (EFG projection)
-        (0, 2, "receiver"),
-        (1, 2, "receiver"),
-        (2, 2, "receiver"),
-        (2, 2, "multipoles"),
-    ])
-    def test_features_match_kspace(self, neutral_l0_system, neutral_l1_system,
-                                   neutral_l2_system, dl, pl, norm):
+    @pytest.mark.parametrize(
+        "dl,pl,norm",
+        [
+            (0, 0, "receiver"),
+            (1, 0, "receiver"),
+            (0, 1, "receiver"),
+            (1, 1, "receiver"),
+            (1, 1, "multipoles"),
+            # quadrupole feature path (EFG projection)
+            (0, 2, "receiver"),
+            (1, 2, "receiver"),
+            (2, 2, "receiver"),
+            (2, 2, "multipoles"),
+        ],
+    )
+    def test_features_match_kspace(self, neutral_l0_system, neutral_l1_system, neutral_l2_system, dl, pl, norm):
         sys = self._pick(dl, neutral_l0_system, neutral_l1_system, neutral_l2_system)
         F_ref = self._run_ref(self._ref(dl, pl, norm), sys)
         F_pme = self._run_pme(self._pme(dl, pl, norm), sys)
@@ -646,12 +762,18 @@ class TestPMEFeatures:
     def test_non_pbc_falls_back(self, neutral_l1_system):
         sys = neutral_l1_system
         pme = self._pme(1, 1)
-        out = pme(sys["source_feats"].unsqueeze(1), sys["positions"], sys["batch"],
-                  sys["box"], torch.zeros(1, 3, dtype=torch.bool))
+        out = pme(
+            sys["source_feats"].unsqueeze(1),
+            sys["positions"],
+            sys["batch"],
+            sys["box"],
+            torch.zeros(1, 3, dtype=torch.bool),
+        )
         assert torch.isfinite(out).all()
 
 
 # ── regression (pinned values) ────────────────────────────────────────────────
+
 
 class TestRegressions:
     """
@@ -661,15 +783,34 @@ class TestRegressions:
 
     def test_l0_energy_regression(self, neutral_l0_system):
         sys = neutral_l0_system
-        ref = GTOElectrostaticEnergy(0, SIGMA_SRC, KCUT, include_self_interaction=False,
-                                     include_pbc_corrections=False)
-        E_ref = ref(sys["k_vecs"], sys["k_norm2"], sys["k_batch"], sys["k0_mask"],
-                    sys["source_feats"], sys["positions"], sys["batch"],
-                    sys["volume"], sys["pbc"])
+        ref = GTOElectrostaticEnergy(
+            0,
+            SIGMA_SRC,
+            KCUT,
+            include_self_interaction=False,
+            include_pbc_corrections=False,
+        )
+        E_ref = ref(
+            sys["k_vecs"],
+            sys["k_norm2"],
+            sys["k_batch"],
+            sys["k0_mask"],
+            sys["source_feats"],
+            sys["positions"],
+            sys["batch"],
+            sys["volume"],
+            sys["pbc"],
+        )
 
         pme = PMEElectrostaticEnergy(0, SIGMA_SRC, MESH, include_pbc_corrections=False)
-        E_pme = pme(sys["source_feats"], sys["positions"], sys["batch"],
-                    sys["box"], sys["volume"], sys["pbc"])
+        E_pme = pme(
+            sys["source_feats"],
+            sys["positions"],
+            sys["batch"],
+            sys["box"],
+            sys["volume"],
+            sys["pbc"],
+        )
 
         assert torch.sign(E_pme) == torch.sign(E_ref) or E_ref.abs() < 1e-6
         rel = (E_pme - E_ref).abs() / E_ref.abs().clamp(min=1e-8)
@@ -678,20 +819,37 @@ class TestRegressions:
     def test_l1_feature_regression(self, neutral_l1_system):
         sys = neutral_l1_system
         ref = GTOElectrostaticFeatures(
-            1, SIGMA_SRC, 1, SIGMA_PROJ, False, KCUT,
+            1,
+            SIGMA_SRC,
+            1,
+            SIGMA_PROJ,
+            False,
+            KCUT,
         )
-        F_ref = ref(sys["k_vecs"], sys["k_norm2"], sys["k_batch"], sys["k0_mask"],
-                    sys["source_feats"], sys["positions"], sys["batch"],
-                    sys["volume"], sys["pbc"])
+        F_ref = ref(
+            sys["k_vecs"],
+            sys["k_norm2"],
+            sys["k_batch"],
+            sys["k0_mask"],
+            sys["source_feats"],
+            sys["positions"],
+            sys["batch"],
+            sys["volume"],
+            sys["pbc"],
+        )
         pme = PMEElectrostaticFeatures(1, SIGMA_SRC, 1, SIGMA_PROJ, MESH)
-        F_pme = pme(sys["source_feats"].unsqueeze(1), sys["positions"], sys["batch"],
-                    sys["box"], sys["pbc"])
+        F_pme = pme(
+            sys["source_feats"].unsqueeze(1),
+            sys["positions"],
+            sys["batch"],
+            sys["box"],
+            sys["pbc"],
+        )
 
         # Check max absolute error relative to max feature magnitude
         abs_err = (F_pme - F_ref).abs().max()
         scale = F_ref.abs().max().clamp(min=1e-8)
-        assert (abs_err / scale).item() < 0.005, \
-            f"Feature regression: rel_err={abs_err/scale:.4f}"
+        assert (abs_err / scale).item() < 0.005, f"Feature regression: rel_err={abs_err / scale:.4f}"
 
 
 # ---------------------------------------------------------------------------
@@ -733,15 +891,23 @@ def test_pme_matches_ewald_on_triclinic_cell(density_max_l):
     dtype, sigma, kcut, mesh = torch.float64, 1.5, 3.0, 48
     cell, positions, source, batch, pbc, volume = _triclinic_case(dtype, density_max_l)
 
-    ewald = GTOElectrostaticEnergy(density_max_l, sigma, kcut,
-                                   include_self_interaction=False).to(dtype)
-    pme = pme_module.PMEElectrostaticEnergy(density_max_l, sigma, mesh,
-                                            include_self_interaction=False).to(dtype)
+    ewald = GTOElectrostaticEnergy(density_max_l, sigma, kcut, include_self_interaction=False).to(dtype)
+    pme = pme_module.PMEElectrostaticEnergy(density_max_l, sigma, mesh, include_self_interaction=False).to(dtype)
 
     rcell = 2.0 * torch.pi * torch.linalg.inv(cell).transpose(-1, -2)
     kv, knorm2, kbatch, k0 = compute_k_vectors_flat(kcut, cell.unsqueeze(0), rcell.unsqueeze(0))
-    e_ewald = ewald(kv, knorm2, kbatch, k0, source, positions, batch, volume, pbc,
-                    force_pbc_evaluator=True)
+    e_ewald = ewald(
+        kv,
+        knorm2,
+        kbatch,
+        k0,
+        source,
+        positions,
+        batch,
+        volume,
+        pbc,
+        force_pbc_evaluator=True,
+    )
     e_pme = pme(source, positions, batch, cell.unsqueeze(0), volume, pbc)
 
     g_ewald = torch.autograd.grad(e_ewald.sum(), positions, retain_graph=True)[0]
@@ -768,13 +934,22 @@ def test_pme_triclinic_agreement_is_mesh_convergent():
     ewald = GTOElectrostaticEnergy(2, sigma, kcut, include_self_interaction=False).to(dtype)
     rcell = 2.0 * torch.pi * torch.linalg.inv(cell).transpose(-1, -2)
     kv, knorm2, kbatch, k0 = compute_k_vectors_flat(kcut, cell.unsqueeze(0), rcell.unsqueeze(0))
-    e_ewald = ewald(kv, knorm2, kbatch, k0, source, positions, batch, volume, pbc,
-                    force_pbc_evaluator=True)
+    e_ewald = ewald(
+        kv,
+        knorm2,
+        kbatch,
+        k0,
+        source,
+        positions,
+        batch,
+        volume,
+        pbc,
+        force_pbc_evaluator=True,
+    )
 
     errs = []
     for mesh in (12, 48):
-        pme = pme_module.PMEElectrostaticEnergy(2, sigma, mesh,
-                                                include_self_interaction=False).to(dtype)
+        pme = pme_module.PMEElectrostaticEnergy(2, sigma, mesh, include_self_interaction=False).to(dtype)
         e_pme = pme(source, positions, batch, cell.unsqueeze(0), volume, pbc)
         errs.append(float((e_pme - e_ewald).abs().max() / e_ewald.abs().max().clamp_min(1e-30)))
 

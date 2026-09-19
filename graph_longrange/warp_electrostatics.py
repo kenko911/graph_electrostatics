@@ -326,8 +326,12 @@ def _compute_pme_single_fused_warp(
     differentiable operation while retaining live-cell NPT gradients.
     """
     del geometry_cache  # The Warp primitive builds and fuses its own stencil.
-    if coords.dtype == torch.float32 and spline_order != 6:
-        raise ValueError("Float32 fused Warp PME requires spline_order=6; use Torch PME for other spline orders.")
+    if spline_order != 6:
+        # Any dtype: the reciprocal preparation always builds the ORDER-6 B-spline influence
+        # function (theta), so another spread order would be deconvolved with the wrong theta
+        # (measured 1.6e-2 energy / 1.1e-2 force error at order 4 in float64). float32 additionally
+        # has no stable graph-owned stencil outside order 6.
+        raise ValueError("The fused Warp PME requires spline_order=6; use Torch PME for other spline orders.")
     if reciprocal_cache is None:
         reciprocal_cache = _precompute_pme_reciprocal_rfft(box, alpha, K)
 

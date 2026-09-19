@@ -154,16 +154,19 @@ def test_fused_warp_pme_matches_reference(mesh, dtype, rank, warp_input_default_
         torch.testing.assert_close(actual_grad, expected_grad, atol=tolerance, rtol=tolerance)
 
 
-def test_float32_fused_warp_pme_rejects_unstable_spline_orders():
-    """Do not silently fall back to unstable toolkit float32 spline kernels."""
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_fused_warp_pme_rejects_unstable_spline_orders(dtype):
+    """Do not silently fall back to unstable toolkit float32 spline kernels, and do not run ANY
+    dtype at an order the reciprocal preparation cannot deconvolve: theta is always order 6, so
+    order 4 was ~1.6e-2 (energy) / 1.1e-2 (force) off in float64."""
     pytest.importorskip("nvalchemiops")
     from graph_longrange.warp_electrostatics import _compute_pme_single_fused_warp
 
     with pytest.raises(ValueError, match="requires spline_order=6"):
         _compute_pme_single_fused_warp(
-            torch.zeros(1, 3, dtype=torch.float32),
-            torch.eye(3, dtype=torch.float32),
-            torch.ones(1, dtype=torch.float32),
+            torch.zeros(1, 3, dtype=dtype),
+            torch.eye(3, dtype=dtype),
+            torch.ones(1, dtype=dtype),
             None,
             1.0,
             8,

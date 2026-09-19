@@ -93,8 +93,9 @@ def test_npt_grid_cache_preserves_l2_values_forces_and_cell_gradients(dtype):
 
 @pytest.mark.parametrize("mesh", [8, 10])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_fused_warp_pme_l2_matches_reference(mesh, dtype, warp_input_default_dtype):
-    """Unified Warp spread/gather preserves the order-6 l=2 PME definition and NPT derivatives."""
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_fused_warp_pme_matches_reference(mesh, dtype, rank, warp_input_default_dtype):
+    """Unified Warp spread/gather preserves order-6 PME through l=2."""
     pytest.importorskip("nvalchemiops")
     from graph_longrange.warp_electrostatics import _compute_pme_single_fused_warp
 
@@ -112,17 +113,19 @@ def test_fused_warp_pme_l2_matches_reference(mesh, dtype, warp_input_default_dty
     Q_data = 0.5 * (Q_data + Q_data.transpose(-1, -2))
     trace = Q_data.diagonal(dim1=-2, dim2=-1).sum(-1)
     Q = (Q_data - torch.eye(3, dtype=dtype) * trace[:, None, None] / 3.0).requires_grad_()
+    p_arg = p if rank >= 1 else None
+    Q_arg = Q if rank >= 2 else None
     alpha = 1.0 / 2.4
     reciprocal = pme_module._precompute_pme_reciprocal(box, alpha, mesh)
     expected = pme_module.compute_pme_single(
         coords,
         box,
         q,
-        p,
+        p_arg,
         alpha,
         mesh,
-        rank=2,
-        Q=Q,
+        rank=rank,
+        Q=Q_arg,
         want_field=True,
         want_hessian=True,
         reciprocal_cache=reciprocal,
@@ -131,11 +134,11 @@ def test_fused_warp_pme_l2_matches_reference(mesh, dtype, warp_input_default_dty
         coords,
         box,
         q,
-        p,
+        p_arg,
         alpha,
         mesh,
-        rank=2,
-        Q=Q,
+        rank=rank,
+        Q=Q_arg,
         want_field=True,
         want_hessian=True,
     )
@@ -144,11 +147,29 @@ def test_fused_warp_pme_l2_matches_reference(mesh, dtype, warp_input_default_dty
         torch.testing.assert_close(actual_value, expected_value, atol=tolerance, rtol=tolerance)
 
     weights = tuple(torch.randn_like(value) for value in expected)
-    variables = (coords, box, q, p, Q)
+    variables = (coords, box, q) + ((p,) if rank >= 1 else ()) + ((Q,) if rank >= 2 else ())
     expected_grads = torch.autograd.grad(expected, variables, weights, retain_graph=True)
     actual_grads = torch.autograd.grad(actual, variables, weights)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, atol=tolerance, rtol=tolerance)
+
+
+def test_float32_fused_warp_pme_rejects_unstable_spline_orders():
+    """Do not silently fall back to unstable toolkit float32 spline kernels."""
+    pytest.importorskip("nvalchemiops")
+    from graph_longrange.warp_electrostatics import _compute_pme_single_fused_warp
+
+    with pytest.raises(ValueError, match="requires spline_order=6"):
+        _compute_pme_single_fused_warp(
+            torch.zeros(1, 3, dtype=torch.float32),
+            torch.eye(3, dtype=torch.float32),
+            torch.ones(1, dtype=torch.float32),
+            None,
+            1.0,
+            8,
+            rank=0,
+            spline_order=4,
+        )
 
 
 def test_graph_owned_gather_matches_stable_torch_through_double_backward(

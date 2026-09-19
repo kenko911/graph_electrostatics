@@ -326,6 +326,8 @@ def _compute_pme_single_fused_warp(
     differentiable operation while retaining live-cell NPT gradients.
     """
     del geometry_cache  # The Warp primitive builds and fuses its own stencil.
+    if coords.dtype == torch.float32 and spline_order != 6:
+        raise ValueError("Float32 fused Warp PME requires spline_order=6; use Torch PME for other spline orders.")
     if reciprocal_cache is None:
         reciprocal_cache = _precompute_pme_reciprocal_rfft(box, alpha, K)
 
@@ -347,7 +349,7 @@ def _compute_pme_single_fused_warp(
         atom_batch,
     )
     identity_cell = torch.eye(3, dtype=coords.dtype, device=coords.device).unsqueeze(0)
-    use_graph_stencil = coords.dtype == torch.float32 and spline_order == 6 and rank == 2
+    use_graph_stencil = coords.dtype == torch.float32 and spline_order == 6 and 0 <= rank <= 2
     if use_graph_stencil:
         rho_grid = _graph_pme_spread_l2_order6_f32(p_frac, q, d_frac, q_frac, K, K, K)
     else:
@@ -372,9 +374,12 @@ def _compute_pme_single_fused_warp(
     phi_k = rho_k * green / theta_squared
     phi_grid = torch.fft.irfftn(phi_k, s=(K, K, K), norm="forward").to(coords.dtype)
 
+    want_field_actual = want_field or rank >= 1
+    want_hessian_actual = want_hessian or rank >= 2
     if use_graph_stencil:
         phi, gathered_d, gathered_Q = _graph_pme_gather_l2_order6_f32(phi_grid, p_frac)
     else:
+        gather_rank = 2 if want_hessian_actual else 1 if want_field_actual else 0
         phi, gathered_d, gathered_Q = torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t(
             phi_grid,
             p_frac,
@@ -383,10 +388,8 @@ def _compute_pme_single_fused_warp(
             K,
             K,
             spline_order,
-            rank,
+            gather_rank,
         )
-    want_field_actual = want_field or rank >= 1
-    want_hessian_actual = want_hessian or rank >= 2
     cell_inv = cell_inv_batched[0]
     # Fractionalization uses s = r @ A^-1 (cell_inv_t passed to multipole_pme_fractionalize),
     # so ds_i/dr_j = A^-1[j,i] and the back-transform of a fractional-frame gradient is A^-T,

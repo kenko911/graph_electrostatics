@@ -147,6 +147,32 @@ def _expand_axis_weights(weights: torch.Tensor) -> torch.Tensor:
     ).reshape(n, 216, 3)
 
 
+def _stencil_weights(u: torch.Tensor, rank: int):
+    """Tensor-only spline arithmetic, isolated for optional compilation tests."""
+    basis = _bspline(u)
+    x, y, z = basis.unbind(-1)
+    basis_product = _axis_product(x, y, z)
+    gradient_weights = None
+    hessian_weights = None
+    if rank >= 1:
+        basis_gradient = _bspline_prime(u)
+        dx, dy, dz = basis_gradient.unbind(-1)
+        gradient_weights = torch.stack(
+            [
+                _axis_product(dx, y, z),
+                _axis_product(x, dy, z),
+                _axis_product(x, y, dz),
+            ],
+            dim=2,
+        )
+    if rank >= 2:
+        basis_hessian = _bspline_double_prime(u)
+        hessian_weights = _symmetric_hessian_weights(
+            basis, basis_gradient, basis_hessian
+        )
+    return basis_product, gradient_weights, hessian_weights
+
+
 def build_pme_geometry_optimized(
     coords: torch.Tensor,
     box: torch.Tensor,
@@ -169,27 +195,7 @@ def build_pme_geometry_optimized(
     ).long()
     axis_shifts = torch.arange(-3, 3, device=coords.device, dtype=coords.dtype)
     u = u0[:, None, :] + axis_shifts[None, :, None]
-    basis = _bspline(u)
-    x, y, z = basis.unbind(-1)
-    basis_product = _axis_product(x, y, z)
-    gradient_weights = None
-    hessian_weights = None
-    if rank >= 1:
-        basis_gradient = _bspline_prime(u)
-        dx, dy, dz = basis_gradient.unbind(-1)
-        gradient_weights = torch.stack(
-            [
-                _axis_product(dx, y, z),
-                _axis_product(x, dy, z),
-                _axis_product(x, y, dz),
-            ],
-            dim=2,
-        )
-    if rank >= 2:
-        basis_hessian = _bspline_double_prime(u)
-        hessian_weights = _symmetric_hessian_weights(
-            basis, basis_gradient, basis_hessian
-        )
+    basis_product, gradient_weights, hessian_weights = _stencil_weights(u, rank)
     return {
         "N": N,
         "Nj": Nj,
@@ -299,6 +305,7 @@ def compute_pme_single_optimized(
     want_hessian: bool = False,
     reciprocal_cache: dict | None = None,
     geometry_cache: dict | None = None,
+    structure_factor_cache: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Single-structure PME using rFFT and one shared spread/gather stencil.
 
@@ -306,6 +313,8 @@ def compute_pme_single_optimized(
     mesh uses the nonredundant Hermitian half-spectrum, while precomputed
     interpolation weights are reused for spreading and gathering.
     """
+    if structure_factor_cache is not None and torch.is_grad_enabled():
+        raise ValueError("PME spectrum sharing is supported only under torch.no_grad()")
     if reciprocal_cache is None:
         reciprocal_cache = _precompute_pme_reciprocal_rfft(box, alpha, K)
     if geometry_cache is None:
@@ -313,13 +322,15 @@ def compute_pme_single_optimized(
             coords, box, K, rank=max(rank, int(want_field), 2 * int(want_hessian)),
             Nj=reciprocal_cache["Nj"],
         )
-    mesh = _spread_with_geometry(
-        geometry_cache,
-        q,
-        p if rank >= 1 else None,
-        Q if rank >= 2 else None,
-    )
-    structure_factor = torch.fft.rfftn(mesh)
+    # Only reuse within a call with identical coordinates, mesh, and multipoles.
+    # This is not an MD-step or SCF-state cache: those source tensors can change.
+    if structure_factor_cache is None:
+        mesh = _spread_with_geometry(
+            geometry_cache, q, p if rank >= 1 else None, Q if rank >= 2 else None,
+        )
+        structure_factor = torch.fft.rfftn(mesh)
+    else:
+        structure_factor = structure_factor_cache
     coulomb, theta_squared = _pme_rfft_factors(reciprocal_cache, K)
     potential_k = coulomb * structure_factor / theta_squared
     potential_grid = torch.fft.irfftn(
@@ -436,6 +447,14 @@ def _pme_features_impl(
         else None
     )
     sqrt_three = math.sqrt(3.0)
+    # Spectrum sharing is forward-only in every dtype. Derivative calculations
+    # retain separate spread/FFT graphs for each Gaussian width.
+    share_spectrum = (
+        compute is compute_pme_single_optimized and len(module.alphas) > 1
+        and not torch.is_grad_enabled()
+    )
+    shared_spectra = {}
+    shared_stencils = {}
 
     for sigma_index, alpha in enumerate(module.alphas):
         for graph_index in range(n_graphs):
@@ -446,6 +465,26 @@ def _pme_features_impl(
             quadrupoles = None
             if module.density_max_l >= 2:
                 quadrupoles = _l2_source_to_cartesian(feats[mask][:, 4:9]) * _PME_QUAD_SH_TO_CART
+            reciprocal_here = (
+                reciprocal[sigma_index][graph_index] if reciprocal is not None
+                else geometry_cache[graph_index]["reciprocal"][alpha]
+            )
+            geometry_here = None if geometry_cache is None else geometry_cache[graph_index]
+            extra = {}
+            if share_spectrum:
+                if graph_index not in shared_spectra:
+                    if geometry_here is None:
+                        geometry_here = build_pme_geometry_optimized(
+                            positions, box[graph_index], module.mesh_size,
+                            rank=max(module.density_max_l, module.feature_max_l),
+                            Nj=reciprocal_here["Nj"],
+                        )
+                    shared_stencils[graph_index] = geometry_here
+                    shared_spectra[graph_index] = torch.fft.rfftn(
+                        _spread_with_geometry(geometry_here, q, dipoles, quadrupoles)
+                    )
+                geometry_here = shared_stencils[graph_index]
+                extra["structure_factor_cache"] = shared_spectra[graph_index]
             phi, field, hessian = compute(
                 positions,
                 box[graph_index],
@@ -457,12 +496,9 @@ def _pme_features_impl(
                 Q=quadrupoles,
                 want_field=module.feature_max_l >= 1,
                 want_hessian=module.feature_max_l >= 2,
-                reciprocal_cache=(
-                    reciprocal[sigma_index][graph_index]
-                    if reciprocal is not None
-                    else geometry_cache[graph_index]["reciprocal"][alpha]
-                ),
-                geometry_cache=None if geometry_cache is None else geometry_cache[graph_index],
+                reciprocal_cache=reciprocal_here,
+                geometry_cache=geometry_here,
+                **extra,
             )
 
             phi_corr = phi - 2.0 * alpha / math.sqrt(math.pi) * q

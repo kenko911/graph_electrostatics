@@ -60,6 +60,8 @@ try:
     from nvalchemiops.torch.interactions.electrostatics.pme_multipole import (
         multipole_pme_reciprocal_space,
     )
+    from ._warp_pme_ops import fractionalize as _graph_pme_fractionalize
+    from ._warp_pme_ops import gather_l2_order6_f32 as _graph_pme_gather_l2_order6_f32
 
     HAS_NVALCHEMIOPS = True
 except Exception:  # pragma: no cover - toolkit optional
@@ -343,7 +345,7 @@ def _compute_pme_single_fused_warp(
         if rank >= 2 and Q is not None
         else torch.zeros((n_atoms, 3, 3), dtype=coords.dtype, device=coords.device)
     )
-    p_frac, d_frac, q_frac = torch.ops.nvalchemiops.multipole_pme_fractionalize(
+    p_frac, d_frac, q_frac = _graph_pme_fractionalize(
         coords,
         cell_inv_t,
         dipoles,
@@ -372,16 +374,23 @@ def _compute_pme_single_fused_warp(
     phi_k = rho_k * green / theta_squared
     phi_grid = torch.fft.irfftn(phi_k, s=(K, K, K), norm="forward").to(coords.dtype)
 
-    phi, gathered_d, gathered_Q = torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t(
-        phi_grid,
-        p_frac,
-        identity_cell,
-        K,
-        K,
-        K,
-        spline_order,
-        rank,
-    )
+    if coords.dtype == torch.float32 and spline_order == 6 and rank == 2:
+        phi, gathered_d, gathered_Q = _graph_pme_gather_l2_order6_f32(
+            phi_grid, p_frac
+        )
+    else:
+        phi, gathered_d, gathered_Q = (
+            torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t(
+                phi_grid,
+                p_frac,
+                identity_cell,
+                K,
+                K,
+                K,
+                spline_order,
+                rank,
+            )
+        )
     want_field_actual = want_field or rank >= 1
     want_hessian_actual = want_hessian or rank >= 2
     cell_inv = cell_inv_batched[0]

@@ -86,14 +86,13 @@ def test_npt_grid_cache_preserves_l2_values_forces_and_cell_gradients(dtype):
 
 
 @pytest.mark.parametrize("mesh", [8, 10])
-@pytest.mark.parametrize("dtype", [
-    pytest.param(torch.float32, marks=pytest.mark.xfail(
-        reason="Pre-existing float32 toolkit mismatch against stable Torch PME", strict=True)),
-    torch.float64,
-])
-def test_fused_warp_pme_l2_matches_reference(mesh, dtype):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_fused_warp_pme_l2_matches_reference(mesh, dtype, warp_input_default_dtype):
     """Unified Warp spread/gather preserves the order-6 l=2 PME definition and NPT derivatives."""
     pytest.importorskip("nvalchemiops")
+    from nvalchemiops.math import spline
+    if dtype == torch.float32 and not hasattr(spline, "_bspline6_local"):
+        pytest.xfail("Installed toolkit lacks the stable order-6 spline fix")
     from graph_longrange.warp_electrostatics import _compute_pme_single_fused_warp
 
     torch.manual_seed(322)
@@ -128,6 +127,96 @@ def test_fused_warp_pme_l2_matches_reference(mesh, dtype):
     actual_grads = torch.autograd.grad(actual, variables, weights)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, atol=tolerance, rtol=tolerance)
+
+
+def test_graph_owned_gather_matches_toolkit_through_double_backward(
+    float32_default_dtype,
+):
+    """The graph-owned MD specialization preserves first and second derivatives."""
+    pytest.importorskip("nvalchemiops")
+    from graph_longrange._warp_pme_ops import gather_l2_order6_f32
+
+    torch.manual_seed(825)
+    phi = torch.randn(8, 8, 8, dtype=torch.float32, requires_grad=True)
+    positions = torch.rand(7, 3, dtype=torch.float32, requires_grad=True)
+    identity = torch.eye(3, dtype=torch.float32).unsqueeze(0)
+
+    expected = torch.ops.nvalchemiops.multipole_pme_gather_via_spread_t(
+        phi, positions, identity, 8, 8, 8, 6, 2
+    )
+    actual = gather_l2_order6_f32(phi, positions)
+    weights = tuple(torch.randn_like(value) for value in expected)
+    expected_first = torch.autograd.grad(
+        expected, (phi, positions), weights, create_graph=True, retain_graph=True
+    )
+    actual_first = torch.autograd.grad(
+        actual, (phi, positions), weights, create_graph=True, retain_graph=True
+    )
+    grad_grad = tuple(torch.randn_like(value) for value in expected_first)
+    expected_second = torch.autograd.grad(
+        expected_first, (phi, positions), grad_grad, retain_graph=True
+    )
+    actual_second = torch.autograd.grad(
+        actual_first, (phi, positions), grad_grad
+    )
+
+    for observed, reference in zip(actual + actual_first, expected + expected_first):
+        torch.testing.assert_close(observed, reference, atol=4e-6, rtol=4e-6)
+    for observed, reference in zip(actual_second, expected_second):
+        torch.testing.assert_close(observed, reference, atol=3e-5, rtol=2e-5)
+
+
+def test_graph_owned_fractionalize_reduced_cell_gradient_matches_toolkit(
+    float32_default_dtype, monkeypatch
+):
+    """The CUDA cell-gradient reduction is numerically faithful in float32."""
+    pytest.importorskip("nvalchemiops")
+    from graph_longrange import _warp_pme_ops
+
+    # Exercise the CUDA-only algorithm on the CPU Warp backend in CI.
+    monkeypatch.setattr(_warp_pme_ops, "_REDUCED_CELL_DEVICE_TYPES", {"cpu", "cuda"})
+    torch.manual_seed(826)
+    positions = torch.randn(17, 3, dtype=torch.float32, requires_grad=True)
+    cell_inv_t = (
+        torch.eye(3, dtype=torch.float32).unsqueeze(0)
+        + 0.05 * torch.randn(1, 3, 3, dtype=torch.float32)
+    ).requires_grad_()
+    dipoles = torch.randn(17, 3, dtype=torch.float32, requires_grad=True)
+    quadrupoles = torch.randn(17, 3, 3, dtype=torch.float32, requires_grad=True)
+    batch = torch.zeros(17, dtype=torch.int32)
+    variables = (positions, cell_inv_t, dipoles, quadrupoles)
+
+    expected = torch.ops.nvalchemiops.multipole_pme_fractionalize(
+        *variables, batch
+    )
+    actual = _warp_pme_ops.fractionalize(*variables, batch)
+    weights = tuple(torch.randn_like(value) for value in expected)
+    expected_first = torch.autograd.grad(
+        expected, variables, weights, create_graph=True, retain_graph=True
+    )
+    actual_first = torch.autograd.grad(
+        actual, variables, weights, create_graph=True, retain_graph=True
+    )
+    grad_grad = tuple(torch.randn_like(value) for value in expected_first)
+    expected_second = torch.autograd.grad(
+        expected_first, variables, grad_grad, retain_graph=True
+    )
+    actual_second = torch.autograd.grad(actual_first, variables, grad_grad)
+
+    for observed, reference in zip(actual + actual_first, expected + expected_first):
+        torch.testing.assert_close(observed, reference, atol=4e-6, rtol=4e-6)
+    for observed, reference in zip(actual_second, expected_second):
+        torch.testing.assert_close(observed, reference, atol=3e-5, rtol=2e-5)
+
+
+@pytest.fixture
+def warp_input_default_dtype(request):
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(request.node.callspec.params["dtype"])
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
 
 
 @pytest.mark.parametrize("mesh", [8, 10, 32])
@@ -203,6 +292,52 @@ def test_fused_warp_pme_l2_energy_matches_reference_in_float64():
     actual_grads = torch.autograd.grad(actual, (coords, box, source))
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, atol=5e-9, rtol=5e-9)
+
+
+def test_graph_owned_float32_warp_pme_energy_matches_reference_at_mesh32(
+    float32_default_dtype,
+):
+    """Production-mesh energy, force, stress, and source VJPs remain close."""
+    pytest.importorskip("nvalchemiops")
+    from nvalchemiops.math import spline
+
+    if not hasattr(spline, "_bspline6_local"):
+        pytest.xfail("Installed toolkit lacks the stable order-6 spread spline")
+    from graph_longrange.warp_electrostatics import PMEElectrostaticEnergyWarpPME
+
+    torch.manual_seed(323)
+    n_atoms, mesh = 5, 32
+    coords = (torch.rand(n_atoms, 3, dtype=torch.float32) * 4.0).requires_grad_()
+    box = torch.tensor(
+        [[[6.1, 0.2, 0.0], [0.1, 5.8, 0.3], [0.0, 0.2, 6.3]]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    source = torch.randn(n_atoms, 9, dtype=torch.float32, requires_grad=True)
+    batch = torch.zeros(n_atoms, dtype=torch.long)
+    pbc = torch.ones(1, 3, dtype=torch.bool)
+    volume = torch.linalg.det(box)
+    kwargs = {
+        "density_max_l": 2,
+        "density_smearing_width": 1.2,
+        "mesh_size": mesh,
+        "include_self_interaction": True,
+    }
+
+    expected = PMEElectrostaticEnergy(**kwargs)(
+        source, coords, batch, box, volume, pbc
+    )
+    actual = PMEElectrostaticEnergyWarpPME(**kwargs, spline_order=6)(
+        source, coords, batch, box, volume, pbc
+    )
+    expected_grads = torch.autograd.grad(
+        expected, (coords, box, source), retain_graph=True
+    )
+    actual_grads = torch.autograd.grad(actual, (coords, box, source))
+
+    compared = zip((actual,) + actual_grads, (expected,) + expected_grads)
+    for observed, reference in compared:
+        torch.testing.assert_close(observed, reference, atol=2e-4, rtol=2e-4)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

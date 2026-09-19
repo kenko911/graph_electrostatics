@@ -5,7 +5,7 @@ Defaults to float32. Timings measure module calls, not full MD steps.
 """
 
 import argparse
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import json
 from pathlib import Path
 import statistics
@@ -15,6 +15,7 @@ import torch
 
 from graph_longrange.pme import _precompute_pme_reciprocal, compute_pme_single
 from graph_longrange.pme_optimized import compute_pme_single_optimized, _precompute_pme_reciprocal_rfft
+import graph_longrange.pme_optimized as optimized
 
 
 def main():
@@ -25,6 +26,12 @@ def main():
     parser.add_argument("--mesh", type=int, default=32)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--threads", type=int, default=2)
+    parser.add_argument("--compile-stencils", action="store_true",
+                        help="also benchmark isolated Inductor spread/gather fusion; defaults unchanged")
+    parser.add_argument("--check-parity", action="store_true",
+                        help="check module outputs and VJP against uncompiled optimized Torch before timing")
+    parser.add_argument("--parity-atol", type=float, default=2e-5)
+    parser.add_argument("--parity-rtol", type=float, default=2e-5)
     parser.add_argument("--profile", action="store_true", help="print an operator-level profile for each mode")
     parser.add_argument("--profile-repeats", type=int, default=3)
     parser.add_argument("--trace-dir", type=Path, help="save Chrome traces (requires --profile)")
@@ -39,6 +46,8 @@ def main():
     torch.manual_seed(74)
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype)
+    # Toolkit backward factories must use the same default dtype as inputs.
+    torch.set_default_dtype(dtype)
     if device.type == "cuda" and not torch.cuda.is_available():
         parser.error("CUDA is unavailable")
     print(json.dumps({"metadata": {"torch": torch.__version__, "cuda": torch.version.cuda,
@@ -57,6 +66,24 @@ def main():
     Q -= torch.eye(3, device=device, dtype=dtype) * Q.diagonal(dim1=-2, dim2=-1).sum(-1)[:, None, None] / 3
     weights = (torch.randn_like(q), torch.randn_like(p), torch.randn_like(Q))
     methods = {"reference": compute_pme_single, "torch": compute_pme_single_optimized}
+    original_stencils = (optimized._stencil_weights, optimized._spread_with_geometry,
+                         optimized._gather_with_geometry)
+    compiled_stencils = None
+    if args.compile_stencils:
+        if "torch" not in args.backends:
+            parser.error("--compile-stencils requires the torch backend")
+        compiled_stencils = tuple(torch.compile(fn, fullgraph=True) for fn in original_stencils)
+        methods["torch_compiled"] = compute_pme_single_optimized
+        args.backends.append("torch_compiled")
+
+    @contextmanager
+    def stencil_mode(compiled):
+        if compiled:
+            optimized._stencil_weights, optimized._spread_with_geometry, optimized._gather_with_geometry = compiled_stencils
+        try:
+            yield
+        finally:
+            optimized._stencil_weights, optimized._spread_with_geometry, optimized._gather_with_geometry = original_stencils
     if "warp" in args.backends:
         from graph_longrange.warp_electrostatics import _compute_pme_single_fused_warp
         methods["warp"] = _compute_pme_single_fused_warp
@@ -71,22 +98,47 @@ def main():
         for backend in args.backends:
             prepare = _precompute_pme_reciprocal if backend == "reference" else _precompute_pme_reciprocal_rfft
             static = prepare(box, 1 / 3., args.mesh) if not backward else None
-            def call(profiling=False):
+            def call(profiling=False, compiled=None, method=None):
                 def scope(name):
                     return torch.profiler.record_function(name) if profiling else nullcontext()
 
-                with torch.set_grad_enabled(backward):
+                use_compiled = backend == "torch_compiled" if compiled is None else compiled
+                with torch.set_grad_enabled(backward), stencil_mode(use_compiled):
                     variables = tuple(v.detach().requires_grad_(backward) for v in (coords, box, q, p, Q))
                     x, cell, charges, dipoles, quads = variables
                     with scope("PME_reciprocal_preparation"):
                         reciprocal = prepare(cell, 1 / 3., args.mesh) if backward else static
                     with scope("PME_forward"):
-                        out = methods[backend](x, cell, charges, dipoles, 1 / 3., args.mesh, 2,
+                        out = (methods[backend] if method is None else method)(x, cell, charges, dipoles, 1 / 3., args.mesh, 2,
                                                want_field=True, Q=quads, want_hessian=True,
                                                reciprocal_cache=reciprocal)
                     if backward:
                         with scope("PME_backward_VJP"):
-                            torch.autograd.grad(out, variables, weights)
+                            gradients = torch.autograd.grad(out, variables, weights)
+                    return tuple(v.detach() for v in out) + (gradients if backward else ())
+            if args.check_parity:
+                reference = call(compiled=False, method=compute_pme_single_optimized)
+                candidate = call()
+                metrics = [{"max_absolute_error": float((a - b).abs().max()),
+                            "relative_to_max_reference": float((a - b).abs().max() /
+                                                               b.abs().max().clamp_min(1e-30))}
+                           for a, b in zip(candidate, reference)]
+                print(json.dumps({"backend": backend, "mode": mode,
+                                  "parity_order": ["phi", "field", "hessian"] +
+                                  (["dpositions", "dcell", "dq", "dp", "dQ"] if backward else []),
+                                  "parity_metrics": metrics}), flush=True)
+                for a, b in zip(candidate, reference):
+                    torch.testing.assert_close(a, b, atol=args.parity_atol, rtol=args.parity_rtol)
+            if backend == "torch_compiled":
+                reference = call(compiled=False)
+                candidate = call(compiled=True)
+                errors = [float((a - b).abs().max()) for a, b in zip(candidate, reference)]
+                for a, b in zip(candidate, reference):
+                    torch.testing.assert_close(a, b, rtol=3e-4 if dtype == torch.float32 else 1e-9,
+                                               atol=3e-5 if dtype == torch.float32 else 1e-10)
+                print(json.dumps({"backend": backend, "mode": mode,
+                                  "compile_parity_max_absolute_errors": errors,
+                                  "compilation_excluded_from_timing": True}), flush=True)
             for _ in range(3):
                 call()
             sync()

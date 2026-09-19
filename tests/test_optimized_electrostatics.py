@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from unittest.mock import patch
 
 from graph_longrange.energy import GTOElectrostaticEnergy
 from graph_longrange.ewald_optimized import (
@@ -27,11 +28,104 @@ from graph_longrange.pme_optimized import (
     _pme_rfft_factors,
     _precompute_pme_reciprocal_rfft,
     _cached_pme_reciprocal_optimized,
+    _pme_features_impl,
     PMEElectrostaticEnergyOptimized,
     PMEElectrostaticFeaturesOptimized,
     build_pme_geometry_optimized,
     compute_pme_single_optimized,
 )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_multiwidth_features_share_fft_without_stale_sources(dtype):
+    """Share only under no_grad; every dtype keeps independent derivative graphs."""
+    torch.manual_seed(813)
+    positions = torch.rand(8, 3, dtype=dtype).requires_grad_()
+    box = torch.tensor([[6., .2, 0.], [.1, 5.8, .3], [0., .1, 6.2]], dtype=dtype)
+    box = box.unsqueeze(0).requires_grad_()
+    source = torch.randn(8, 9, dtype=dtype).requires_grad_()
+    batch = torch.zeros(8, dtype=torch.long)
+    pbc = torch.ones(1, 3, dtype=torch.bool)
+    kwargs = dict(density_max_l=2, density_smearing_width=1.2, feature_max_l=2,
+                  feature_smearing_widths=[.8, 1.2, 1.6], mesh_size=8,
+                  include_self_interaction=False, integral_normalization="receiver")
+    optimized = PMEElectrostaticFeaturesOptimized(**kwargs).to(dtype)
+    # A wrapper disables the identity-based sharing fast path, leaving every
+    # other arithmetic choice identical (isolates this optimization from rFFT).
+    expected = _pme_features_impl(
+        optimized, source, positions, batch, box,
+        lambda *args, **kw: compute_pme_single_optimized(*args, **kw),
+    )
+    with patch("torch.fft.rfftn", wraps=torch.fft.rfftn) as fft:
+        actual = optimized(source, positions, batch, box, pbc)
+        transforms = 3
+        assert fft.call_count == transforms
+        changed = optimized(source * 2, positions, batch, box, pbc)
+        assert fft.call_count == 2 * transforms
+    with torch.no_grad(), patch("torch.fft.rfftn", wraps=torch.fft.rfftn) as fft:
+        no_grad = optimized(source, positions, batch, box, pbc)
+        assert fft.call_count == 1
+        torch.testing.assert_close(no_grad, actual)
+    tolerance = 2e-4 if dtype == torch.float32 else 2e-9
+    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+    torch.testing.assert_close(changed, actual * 2, atol=tolerance, rtol=tolerance)
+    weight = torch.randn_like(actual)
+    variables = (positions, box, source)
+    a = torch.autograd.grad(actual, variables, weight, create_graph=True)
+    b = torch.autograd.grad(expected, variables, weight, create_graph=True)
+    for x, y in zip(a, b):
+        torch.testing.assert_close(x, y, atol=tolerance, rtol=tolerance)
+    # BEC/force-training paths also require derivatives of these derivatives.
+    aa = torch.autograd.grad(sum(x.square().sum() for x in a), variables)
+    bb = torch.autograd.grad(sum(x.square().sum() for x in b), variables)
+    for x, y in zip(aa, bb):
+        torch.testing.assert_close(x, y, atol=tolerance * 10, rtol=tolerance * 10)
+
+
+@pytest.fixture
+def single_thread_cpu_parity():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_shared_spectrum_rejects_gradient_enabled_calls(dtype):
+    with torch.enable_grad(), pytest.raises(ValueError, match="only under torch.no_grad"):
+        compute_pme_single_optimized(
+            torch.zeros(2, 3, dtype=dtype), torch.eye(3, dtype=dtype),
+            torch.ones(2, dtype=dtype), None, 1., 8, rank=0,
+            structure_factor_cache=torch.zeros(8, 8, 5, dtype=torch.complex64),
+        )
+
+
+def test_float32_multiwidth_live_gradients_keep_independent_graphs_at_scale(single_thread_cpu_parity):
+    torch.manual_seed(814)
+    positions = (torch.rand(512, 3, dtype=torch.float32) * 12).requires_grad_()
+    cell = (torch.eye(3, dtype=torch.float32).unsqueeze(0) * 14).requires_grad_()
+    source = (torch.randn(512, 9, dtype=torch.float32) * .1).requires_grad_()
+    batch = torch.zeros(512, dtype=torch.long)
+    module = PMEElectrostaticFeaturesOptimized(
+        density_max_l=2, density_smearing_width=1.2, feature_max_l=2,
+        feature_smearing_widths=[.8, 1.2, 1.6], mesh_size=32,
+        include_self_interaction=False,
+    ).to(torch.float32)
+    reference = _pme_features_impl(
+        module, source, positions, batch, cell,
+        lambda *a, **kw: compute_pme_single_optimized(*a, **kw),
+    )
+    with patch("torch.fft.rfftn", wraps=torch.fft.rfftn) as fft:
+        actual = module(source, positions, batch, cell, torch.ones(1, 3, dtype=torch.bool))
+        assert fft.call_count == 3
+    torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+    variables = (positions, cell, source)
+    a = torch.autograd.grad(actual.square().sum(), variables)
+    b = torch.autograd.grad(reference.square().sum(), variables)
+    for x, y in zip(a, b):
+        torch.testing.assert_close(x, y, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("mesh", [8, 9, 10, 32])
